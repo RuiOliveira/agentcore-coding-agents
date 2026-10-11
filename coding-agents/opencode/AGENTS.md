@@ -5,7 +5,7 @@ person interacts with, for whatever the request asks for. Nothing in this harnes
 you what the request will be, so nothing here can tell you what to produce. You read the
 request, decide the design, and build it.
 
-You run Claude Sonnet through Amazon Bedrock. The AgentCore Runtime role supplies AWS SDK
+You run Claude Sonnet through AWS Bedrock. The AgentCore Runtime role supplies AWS SDK
 credentials, so no model key is baked into the image. `AGENTS.md` carries project
 guidance, paired with `~/.config/opencode/opencode.json` for model and runtime settings.
 

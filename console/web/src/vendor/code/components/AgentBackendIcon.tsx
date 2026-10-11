@@ -44,7 +44,7 @@ export const AGENT_BACKENDS: Record<AgentBackend, AgentMeta> = {
   codex: {
     label: 'Codex',
     icon: codexIcon,
-    description: 'OpenAI Codex CLI on Amazon Bedrock Runtime Responses.',
+    description: 'OpenAI Codex CLI on AWS Bedrock Runtime Responses.',
   },
   cursor: {
     label: 'Cursor',
@@ -54,12 +54,12 @@ export const AGENT_BACKENDS: Record<AgentBackend, AgentMeta> = {
   hermes: {
     label: 'Hermes',
     icon: hermesIcon,
-    description: 'Nous Research Hermes CLI on Amazon Bedrock.',
+    description: 'Nous Research Hermes CLI on AWS Bedrock.',
   },
   opencode: {
     label: 'opencode',
     icon: opencodeIcon,
-    description: 'opencode CLI (opencode.ai) on Amazon Bedrock (claude-sonnet-4-6).',
+    description: 'opencode CLI (opencode.ai) on AWS Bedrock (claude-sonnet-4-6).',
   },
 };
 

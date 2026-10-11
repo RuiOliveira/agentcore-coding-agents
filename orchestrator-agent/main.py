@@ -1,4 +1,4 @@
-"""The orchestrator agent: a Strands agent on Amazon Bedrock AgentCore Runtime.
+"""The orchestrator agent: a Strands agent on AWS Bedrock AgentCore Runtime.
 
 This is the artifact attendees deploy in Module 2 with the `agentcore`
 CLI. It is the SAME shape the CLI scaffolds (`agentcore add agent --framework

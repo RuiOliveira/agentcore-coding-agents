@@ -2,7 +2,7 @@
 # ============================================================
 # opencode launcher for AgentCore Runtime (headless)
 # ============================================================
-# Runs opencode against Amazon Bedrock (the runtime's own region), authenticated
+# Runs opencode against AWS Bedrock (the runtime's own region), authenticated
 # by the AgentCore Runtime IAM role through the AWS SDK credential chain. No API
 # key and no OpenAI/mantle path, so it is unaffected by GPT-5.x allowlisting.
 #

@@ -24,7 +24,7 @@ RUN curl -fsSL -o /tmp/otelcol.tar.gz \
     && rm /tmp/otelcol.tar.gz \
     && /usr/local/bin/otelcol-contrib --version
 
-# opencode CLI: the frontend builder. It runs against Amazon Bedrock through the
+# opencode CLI: the frontend builder. It runs against AWS Bedrock through the
 # runtime role's AWS credential chain (no API key, no OpenAI/mantle path), so it
 # is not affected by the GPT-5.x allowlisting that gates the Codex path.
 # Pinned: 1.18.x dropped the AI-SDK ai.streamText usage spans that Lab 3's
@@ -40,7 +40,7 @@ RUN useradd -m -d /home/agent -u 1000 agent
 COPY _toolchain/ /opt/workshop-cli/
 RUN python3 -m pip install --quiet awscurl $(python3 /opt/workshop-cli/cli_versions.py sdk-requirements)
 
-# opencode config: Amazon Bedrock provider, Claude Sonnet 4.5. A per-run project
+# opencode config: AWS Bedrock provider, Claude Sonnet 4.5. A per-run project
 # AGENTS.md in the working directory carries the role/UI instructions.
 RUN mkdir -p /home/agent/.config/opencode && chown -R agent:agent /home/agent/.config
 COPY --chown=agent:agent opencode.json /home/agent/.config/opencode/opencode.json

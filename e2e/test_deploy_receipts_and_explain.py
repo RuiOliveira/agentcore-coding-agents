@@ -268,7 +268,7 @@ def test_receipt_reports_what_aws_accepted_and_never_env_values():
     runtime_deploy.print_receipt(record, region=REGION, file=buffer,
                                  saved_to="coding-agents/claude-code/runtime_config.json")
     text = buffer.getvalue()
-    assert "What this created: an Amazon Bedrock AgentCore Runtime" in text
+    assert "What this created: an AWS Bedrock AgentCore Runtime" in text
     assert f"Runtime ARN:     {accepted['agentRuntimeArn']}" in text
     assert "Revision:        1, platform V1, READY" in text
     assert IMAGE in text and accepted["roleArn"] in text
@@ -373,7 +373,7 @@ def test_coordinator_receipt_reads_local_state_only(tmp_path):
         "runtime_status": "READY", "platform_version": "V1"}}}))
 
     text = "\n".join(module.receipt_lines(project))
-    assert "the coordinator, an Amazon Bedrock AgentCore Runtime" in text
+    assert "the coordinator, an AWS Bedrock AgentCore Runtime" in text
     assert f"Runtime ARN:     {arn}" in text and "Revision:        2, platform V1, READY" in text
     assert "us.model (ORCHESTRATOR_MODEL_ID)" in text
     assert "arn:aws:iam::1:role/orch" in text

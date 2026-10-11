@@ -459,12 +459,12 @@ _POLICY_WHY = {
     "Telemetry": "export usage telemetry (Lab 3) to CloudWatch and X-Ray",
     "UsageLogs": "write usage records to CloudWatch Logs (Lab 3)",
     "InsightsMetrics": "send usage metrics to CloudWatch Coding Agent Insights (Lab 3)",
-    "BedrockInvoke": "call Amazon Bedrock models",
-    "BedrockOpenAIInference": "call the OpenAI models on Amazon Bedrock",
+    "BedrockInvoke": "call AWS Bedrock models",
+    "BedrockOpenAIInference": "call the OpenAI models on AWS Bedrock",
     "BedrockRuntimeProjectInvoke": "use the default Bedrock project the OpenAI-compatible API needs",
-    "BedrockApiKey": "call Amazon Bedrock with a bearer token",
+    "BedrockApiKey": "call AWS Bedrock with a bearer token",
     "AssumePerUser": "assume the per-user audit role (CloudTrail attribution)",
-    "ECRAuth": "log in to Amazon ECR",
+    "ECRAuth": "log in to AWS ECR",
     "ECRPull": "pull its own container image",
     "S3Files": "mount and write the shared S3 Files workspace",
     "EFS": "use the NFS client the mount is built on",
@@ -525,7 +525,7 @@ def receipt_lines(record: dict, *, region: str, saved_to: str | None = None,
     def row(label: str, value) -> str:
         return f"  {label + ':':<16} {value}"
 
-    lines = ["What this created: an Amazon Bedrock AgentCore Runtime",
+    lines = ["What this created: an AWS Bedrock AgentCore Runtime",
              row("Name", accepted.get("agentRuntimeName", "?")),
              row("Runtime ID", runtime_id),
              row("Runtime ARN", record.get("runtime_arn") or accepted.get("agentRuntimeArn", "?")),
@@ -1092,7 +1092,7 @@ def console_sheet(*, name: str, platform: str, image: str, role_name: str, names
     """Each console field to set, in the order the Create runtime form shows them."""
     mount_leaf = mount_path.removeprefix("/mnt/")
     lines = [
-        "Create it in the console: Amazon Bedrock AgentCore > Runtime > Create runtime",
+        "Create it in the console: AWS Bedrock AgentCore > Runtime > Create runtime",
         "",
         "  Runtime details",
         f"    Name                          {name}   (replace the suggested name)",

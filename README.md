@@ -1,6 +1,6 @@
 <div align="center">
 
-# Coding Agents on Amazon Bedrock AgentCore
+# Coding Agents on AWS Bedrock AgentCore
 
 **Stop prompting agents task by task. Build the loop that ships the work.**
 
@@ -28,7 +28,7 @@ and an independent review read. Then you decide whether to merge.
 A coding agent on a laptop is one person, one session, one machine. A team needs
 more: agents that run where everyone can reach them, work that is checked by
 something other than the agent that wrote it, and a record of who asked for what.
-This repository is a complete, working example of that on Amazon Bedrock AgentCore.
+This repository is a complete, working example of that on AWS Bedrock AgentCore.
 
 ## The idea: build the loop
 
@@ -54,7 +54,7 @@ choice here protects it.
 
 - **A team, not a single tool.** Claude Code builds services, Codex builds
   interfaces, and Kiro checks the work. Each runs in its own AgentCore Runtime
-  session, sharing an Amazon S3 Files workspace. Choose a different roster with one
+  session, sharing an AWS S3 Files workspace. Choose a different roster with one
   setting, no code change.
 - **A coordinator that keeps working.** A Strands agent on AgentCore Runtime reads
   your repository, sends work only to the builders a request needs, and finishes
@@ -62,8 +62,8 @@ choice here protects it.
 - **GitHub without handing out keys.** A GitHub App sits behind AgentCore Gateway.
   Agents get pull requests, never a GitHub credential. Kiro's key stays in
   AgentCore Identity.
-- **Who asked, and what it used.** People sign in with Amazon Cognito. Their
-  identity travels with the work into OpenTelemetry, so Amazon CloudWatch shows
+- **Who asked, and what it used.** People sign in with AWS Cognito. Their
+  identity travels with the work into OpenTelemetry, so AWS CloudWatch shows
   usage per person and per agent.
 
 ## Agent Studio
@@ -106,7 +106,7 @@ browser-based VS Code, and this repository are ready. Open the workshop and star
 at Lab 1.
 
 **In your own AWS account:** launch the workshop stack in one region, then follow
-the same labs. You need Amazon Bedrock model access, a GitHub account, and a Kiro
+the same labs. You need AWS Bedrock model access, a GitHub account, and a Kiro
 subscription for the checker.
 
 <p>

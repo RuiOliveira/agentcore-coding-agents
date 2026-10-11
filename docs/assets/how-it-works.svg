@@ -82,6 +82,6 @@
 
   <rect x="40" y="530" width="1520" height="150" rx="16" fill="#0f172a"/>
   <text x="72" y="572" class="k" fill="#fb923c">ON AWS, NOT ON A LAPTOP</text>
-  <text x="72" y="612" style="font-size:20px" fill="#e2e8f0">Amazon Bedrock AgentCore Runtime · Gateway · Identity</text>
-  <text x="72" y="648" style="font-size:18px" fill="#94a3b8">Shared workspace on Amazon S3 Files · sign-in with Amazon Cognito · OpenTelemetry usage by person in Amazon CloudWatch</text>
+  <text x="72" y="612" style="font-size:20px" fill="#e2e8f0">AWS Bedrock AgentCore Runtime · Gateway · Identity</text>
+  <text x="72" y="648" style="font-size:18px" fill="#94a3b8">Shared workspace on AWS S3 Files · sign-in with AWS Cognito · OpenTelemetry usage by person in AWS CloudWatch</text>
 </svg>

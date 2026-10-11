@@ -1,6 +1,6 @@
 # Gateway MCP: GitHub MCP on AgentCore
 
-Standalone deployment of a GitHub MCP server on Amazon Bedrock AgentCore, fronted by an IAM-authenticated AgentCore Gateway. Includes a sample project with intentional bugs to demonstrate the full flow.
+Standalone deployment of a GitHub MCP server on AWS Bedrock AgentCore, fronted by an IAM-authenticated AgentCore Gateway. Includes a sample project with intentional bugs to demonstrate the full flow.
 
 ## Architecture
 

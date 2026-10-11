@@ -253,7 +253,7 @@ def receipt_lines(project: Path, *, target_name: str = "default",
     def row(label: str, value) -> str:
         return f"  {label + ':':<16} {value}"
 
-    lines = ["What this created: the coordinator, an Amazon Bedrock AgentCore Runtime",
+    lines = ["What this created: the coordinator, an AWS Bedrock AgentCore Runtime",
              row("Runtime ID", runtime_id),
              row("Runtime ARN", record.get("runtime_arn") or entry.get("runtimeArn") or "not recorded"),
              row("Revision", f"{record.get('runtime_version', entry.get('runtimeVersion', '?'))}, "

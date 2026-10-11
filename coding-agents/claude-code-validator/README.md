@@ -10,7 +10,7 @@ Bedrock alone cannot give.
 It decides when a build is done by AUTHORING an executable check for the
 deliverable in front of it, and the engine reads that executable's real exit code.
 There is no deterministic grading contract: nothing in this repository pre-encodes
-what a correct answer looks like, because nobody knew what would be asked. Like the backend, it calls Amazon Bedrock with the Runtime IAM role, so
+what a correct answer looks like, because nobody knew what would be asked. Like the backend, it calls AWS Bedrock with the Runtime IAM role, so
 no model API key is stored in the image. The deployed microVM mounts the shared
 workspace at `/mnt/s3files`.
 

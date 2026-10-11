@@ -44,7 +44,7 @@ is grading.
 Before running anything, confirm with the user (ask only for what is missing):
 
 - **Kiro API key**: the user's OWN key, in the form `ksk_...`. Required for the
-  Identity path. The event provisions a per-team Kiro / Amazon Q Developer Pro
+  Identity path. The event provisions a per-team Kiro / AWS Q Developer Pro
   subscription through IAM Identity Center, and the attendee then mints their own
   key. If they do not have one yet, point them at the Prerequisites page **"Get
   Your Kiro API Key"**: sign in at kiro.dev with the event's Identity Center
