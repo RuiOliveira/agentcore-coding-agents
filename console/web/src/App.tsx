@@ -199,7 +199,7 @@ function Shell() {
         </div>}
       />
       <footer id="console-footer">
-        <span className="console-footer-powered">Powered by AWS Bedrock AgentCore</span>
+        <span className="console-footer-powered">Powered by Amazon Bedrock AgentCore</span>
         <span>Example demo UI · Not an official AWS service</span>
       </footer>
       <Modal visible={preferencesOpen} header="Preferences" onDismiss={() => setPreferencesOpen(false)} closeAriaLabel="Close preferences"

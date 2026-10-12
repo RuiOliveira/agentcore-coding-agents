@@ -16,7 +16,7 @@ description: >-
 > **RESTORE PATH - NOT THE SERVED ROLE**
 >
 > The served validator is Kiro (see `configure-kiro-validator`). The event
-> provisions a per-team Kiro / AWS Q Developer Pro subscription through IAM
+> provisions a per-team Kiro / Amazon Q Developer Pro subscription through IAM
 > Identity Center, and the attendee mints their own `ksk_` key, so Kiro is the
 > checker a normal event run dispatches.
 >

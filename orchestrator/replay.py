@@ -528,7 +528,7 @@ def narrative(run: Any) -> str:
         "not block a green sibling."
     )
     parts.append(f"\n<sub>{getattr(run, 'run_id', 'run')} - built by a coding-agent "
-                 "team on AWS Bedrock AgentCore. This body is generated from the "
+                 "team on Amazon Bedrock AgentCore. This body is generated from the "
                  "run's own record; it reports the loop, it does not judge it.</sub>")
     return "\n".join(parts) + "\n"
 

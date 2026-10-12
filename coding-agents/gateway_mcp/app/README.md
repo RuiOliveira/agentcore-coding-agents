@@ -1,6 +1,6 @@
 # GitHubMCP: MCP Server
 
-An MCP server deployed on AWS Bedrock AgentCore that provides GitHub API access (issues, branches, PRs, labels) to coding agents via the AgentCore Gateway.
+An MCP server deployed on Amazon Bedrock AgentCore that provides GitHub API access (issues, branches, PRs, labels) to coding agents via the AgentCore Gateway.
 
 ## Overview
 

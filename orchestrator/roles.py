@@ -260,7 +260,7 @@ REGISTRY: tuple[Role, ...] = (
         capability="frontend",
         role_name="frontend-builder",
         description="Frontend builder (opencode): builds the part a person "
-                    "interacts with, on AWS Bedrock.",
+                    "interacts with, on Amazon Bedrock.",
         steering_file="AGENTS.md",
         harness_dir="opencode",
         # --dir pins the project to the run workspace (opencode otherwise walks up
@@ -289,7 +289,7 @@ REGISTRY: tuple[Role, ...] = (
         capability="frontend",
         role_name="frontend-builder",
         description="Frontend builder (Codex): builds the part a person "
-                    "interacts with, through AWS Bedrock Runtime.",
+                    "interacts with, through Amazon Bedrock Runtime.",
         steering_file="AGENTS.md",
         harness_dir="codex",
         # The boot config supplies the Runtime region and SDK authentication.
