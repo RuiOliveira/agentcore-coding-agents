@@ -146,11 +146,16 @@ if [[ "$_verify_rc" == "1" ]]; then
 fi
 
 # Build the secret JSON value
+# The webhook secret lets the stack's review endpoint verify that a pull request
+# event really came from this App. It is present when the App was created with the
+# stack's webhook URL; an App without one simply receives no events.
 SECRET_VALUE=$(jq -n \
   --arg app_id "$GITHUB_APP_ID" \
   --arg private_key "$PRIVATE_KEY" \
   --arg installation_id "$GITHUB_APP_INSTALLATION_ID" \
-  '{app_id: $app_id, private_key: $private_key, installation_id: $installation_id}')
+  --arg webhook_secret "${GITHUB_APP_WEBHOOK_SECRET:-}" \
+  '{app_id: $app_id, private_key: $private_key, installation_id: $installation_id}
+   + (if $webhook_secret == "" then {} else {webhook_secret: $webhook_secret} end)')
 
 # Check if secret already exists
 EXISTING=$(aws secretsmanager describe-secret \

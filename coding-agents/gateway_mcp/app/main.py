@@ -693,6 +693,50 @@ def put_file(
 
 
 @mcp.tool()
+def get_pull_request_files(owner: str, repo: str, number: int) -> dict:
+    """A pull request's title, author, head commit, and changed files with patches.
+
+    Returns {title, author, head_sha, base, files: [{filename, status, additions,
+    deletions, patch}]}. GitHub omits the patch of a binary or very large file; such
+    entries carry an empty patch.
+    """
+    with httpx.Client(timeout=30) as c:
+        pr = c.get(f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{number}", headers=_headers())
+        pr.raise_for_status()
+        d = pr.json()
+        files = []
+        page = 1
+        while page <= 10:
+            r = c.get(
+                f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{number}/files",
+                headers=_headers(),
+                params={"per_page": 100, "page": page},
+            )
+            r.raise_for_status()
+            batch = r.json()
+            files += [
+                {
+                    "filename": f["filename"],
+                    "status": f["status"],
+                    "additions": f["additions"],
+                    "deletions": f["deletions"],
+                    "patch": f.get("patch") or "",
+                }
+                for f in batch
+            ]
+            if len(batch) < 100:
+                break
+            page += 1
+    return {
+        "title": d["title"],
+        "author": d["user"]["login"],
+        "head_sha": d["head"]["sha"],
+        "base": d["base"]["ref"],
+        "files": files,
+    }
+
+
+@mcp.tool()
 def create_pull_request(
     owner: str,
     repo: str,

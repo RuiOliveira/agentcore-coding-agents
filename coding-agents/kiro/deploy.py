@@ -236,7 +236,7 @@ def main():
     print("Deployment complete!")
     runtime_deploy.print_receipt(runtime, region=REGION,
                                  saved_to="coding-agents/kiro/runtime_config.json")
-    print("\n  Connect: python kiro/connect.py")
+    print("\n  Connect: ./connect.sh kiro")
     print("=" * 60)
 
 

@@ -48,8 +48,16 @@ export DISABLE_AUTOUPDATER=1
 export HOME="/home/agent"
 
 # An orchestrated interactive PTY hydrates one run-local linked worktree and
-# supplies it here. Manual Lab 1 shells keep the familiar HOME default.
-RUN_DIR="${WORKSHOP_AGENT_WORKDIR:-$HOME}"
+# supplies it here. A person who first cds into a folder (for example one on the
+# shared mount) works in that folder. A fresh shell starts at /, so it keeps the
+# familiar HOME default.
+if [ -n "${WORKSHOP_AGENT_WORKDIR:-}" ]; then
+  RUN_DIR="$WORKSHOP_AGENT_WORKDIR"
+elif [ "$PWD" != "/" ] && [ -w "$PWD" ]; then
+  RUN_DIR="$PWD"
+else
+  RUN_DIR="$HOME"
+fi
 
 # ── No first-run prompts (self-heal on a stale image) ─────────
 # --dangerously-skip-permissions still shows a one-time "Bypass Permissions mode?

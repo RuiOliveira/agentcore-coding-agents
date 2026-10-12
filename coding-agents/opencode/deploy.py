@@ -221,7 +221,7 @@ def main():
     print("Deployment complete!")
     runtime_deploy.print_receipt(runtime, region=REGION,
                                  saved_to="coding-agents/opencode/runtime_config.json")
-    print("\n  Connect: python opencode/connect.py")
+    print("\n  Connect: ./connect.sh opencode")
     print("=" * 60)
 
 

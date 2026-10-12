@@ -42,8 +42,8 @@ def test_an_arcade_initials_field_is_read_not_shown_as_anonymous():
     """Live: an arcade game built from the three-sentence prompt names the player field
     `initials` (the classic high-score name), not `player`. If the reporter did not read
     it, every team would post as "anonymous" and the board would be a column of one word."""
-    assert leaderboard.best_entry([{"initials": "WOW", "score": 420}]) == \
-        {"score": 420, "player": "WOW"}
+    assert leaderboard.best_entry([{"initials": "ACE", "score": 420}]) == \
+        {"score": 420, "player": "ACE"}
     assert leaderboard.best_entry([{"user": "ada", "score": 7}])["player"] == "ada"
     # A real name still wins over the fallbacks when more than one key is present.
     assert leaderboard.best_entry(

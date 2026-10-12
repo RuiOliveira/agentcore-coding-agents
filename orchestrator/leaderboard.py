@@ -5,7 +5,7 @@
         --leaderboard https://<api-id>.execute-api.<region>.amazonaws.com/live/
 
 Why this exists. The room's Lab 2 build is a browser game each team runs on its own
-box, and the wow moment is a single leaderboard on the projector that every team's
+box, and the moment everyone sees is a single leaderboard on the projector that every team's
 scores land on. The game itself knows nothing about that board: the request asks it
 only for a local `GET /api/scores`. This bridge reads that table every few seconds and,
 whenever the team's best improves, posts it to the central account's leaderboard.

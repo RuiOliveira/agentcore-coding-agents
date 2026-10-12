@@ -226,7 +226,7 @@ def main():
     print("Deployment complete!")
     runtime_deploy.print_receipt(runtime, region=REGION,
                                  saved_to="coding-agents/codex/runtime_config.json")
-    print("\n  Connect: python codex/connect.py")
+    print("\n  Connect: ./connect.sh codex")
     print("=" * 60)
 
 

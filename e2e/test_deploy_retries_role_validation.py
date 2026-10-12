@@ -58,6 +58,16 @@ def test_role_validation_failure_is_retried_until_iam_catches_up(clock, monkeypa
     assert len({call["clientToken"] for call in control.calls}) == 1
 
 
+def test_a_reused_role_with_a_just_rewritten_policy_is_retried(clock):
+    """The 2026-10-12 redeploy: the role existed, its policy named a new access point."""
+    stale = validation("Execution role is missing required permissions. "
+                       "Ensure the role has s3files:GetAccessPoint")
+    control = _FakeControl([stale, {"agentRuntimeId": "ok"}])
+    assert runtime_deploy.create_runtime_with_role_retry(
+        control, {"agentRuntimeName": "x"}, budget_s=240) == {"agentRuntimeId": "ok"}
+    assert len(control.calls) == 2 and clock[0] == 20.0
+
+
 def test_other_validation_errors_are_raised_immediately(clock):
     other = validation("Access denied while validating ECR URI 'x'")
     control = _FakeControl([other])

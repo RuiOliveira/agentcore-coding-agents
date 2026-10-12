@@ -223,6 +223,18 @@ def wait_ready(control, runtime_id: str, *, expected_version: str,
     )
 
 
+# The two answers CreateAgentRuntime gives while IAM has not caught up. The first is
+# a new role STS cannot assume yet. The second is a REUSED role whose inline policy
+# was just rewritten (for example for a new stack's S3 Files access point): the
+# service still evaluates the old policy. A live redeploy into the same account on
+# 2026-10-12 failed on the second one, which this helper did not yet retry.
+_ROLE_PROPAGATION = ("Role validation failed", "Execution role is missing required permissions")
+
+
+def _role_still_propagating(exc: Exception) -> bool:
+    return any(marker in str(exc) for marker in _ROLE_PROPAGATION)
+
+
 def create_runtime_with_role_retry(control, parameters: dict, budget_s: float = 240,
                                    *, platform: str | None = None) -> dict:
     """Retry only IAM role propagation, using the same idempotency token."""
@@ -243,7 +255,7 @@ def create_runtime_with_role_retry(control, parameters: dict, budget_s: float = 
         try:
             return control.create_agent_runtime(**request)
         except Exception as exc:
-            if (_code(exc) != "ValidationException" or "Role validation failed" not in str(exc)
+            if (_code(exc) != "ValidationException" or not _role_still_propagating(exc)
                     or time.monotonic() >= deadline):
                 raise
             propagation_error = exc

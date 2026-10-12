@@ -116,4 +116,4 @@ else
   echo "  The stack normally writes the access point; ask a facilitator, then re-run to attach /mnt/s3files." >&2
 fi
 ( cd "${SCRIPT_DIR}/${AGENT}" && python3 deploy.py )
-echo "Done. ${AGENT} runtime_config.json written; the console shelf will reconcile it to ready."
+echo "Done. ${AGENT} is ready; its connection is saved in ${AGENT}/runtime_config.json."

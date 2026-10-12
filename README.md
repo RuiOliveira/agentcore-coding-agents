@@ -2,17 +2,63 @@
 
 # Coding Agents on Amazon Bedrock AgentCore
 
-**Stop prompting agents task by task. Build the loop that ships the work.**
+**Your coding agent, without your laptop's limits.**
 
-Claude Code, Codex, and Kiro work as one team on AWS.<br>
-You ask for a change. You get back a pull request that a separate agent tested<br>
-and an independent review read. Then you decide whether to merge.
+It keeps working when you close the lid, it runs twenty at once,<br>
+and it wakes up on its own when your repository changes.
 
-[Get started](#get-started) · [How it works](#how-it-works) · [Agent Studio](#agent-studio) · [Operator notes](docs/operators.md)
+[Get started](#get-started) · [The three parts](#the-three-parts) · [Go further](#go-further-a-team-that-checks-its-own-work) · [Operator notes](docs/operators.md)
 
 <sub>The code behind the AWS re:Invent 2026 workshop <b>AIM416: Scale your coding agents beyond the laptop with AgentCore</b></sub>
 
 </div>
+
+## Why this exists
+
+Claude Code, Codex, and Kiro feel best in your own terminal, and that terminal is
+the limit. The agent stops when the laptop sleeps, runs one task at a time, and
+waits for you to type. Amazon Bedrock AgentCore Runtime gives every session its own
+microVM, so the same agent can outlive the laptop, run in parallel, and start from
+an event. This repository is a complete, working example, from one container image.
+
+## The three parts
+
+**1. Close the lid.** One command deploys Claude Code to AgentCore Runtime; one
+more opens a terminal inside a new session, a microVM of its own. Give it a task,
+press **Ctrl+]**, close the laptop, and come back to the same conversation with
+the work done. Files live on an S3 Files mount, so they outlive the session.
+
+```bash
+cd coding-agents
+./deploy-prebuilt.sh claude-code   # one Runtime from the prebuilt image
+./connect.sh                       # a new session; Ctrl+] detaches, ./connect.sh --resume returns
+```
+
+**2. Twenty at once.** One command sends the same job to one agent per
+repository. Each agent is a new session, so each is an isolated microVM; a live
+board shows them work, and the host checks every change by calling it.
+
+```bash
+python3 fanout.py --agents 20
+```
+
+**3. It wakes up.** Connect a GitHub repository and open a pull request. GitHub's
+event reaches an endpoint in your stack, which starts a new session that reviews
+the diff and posts the review on the pull request. The agent never holds a
+GitHub token: comments go through AgentCore Gateway.
+
+```bash
+./connect-github.sh owner/repository   # two clicks on GitHub: Create, Install
+```
+
+The reviewer is one file, [`coding-agents/pr_review/handler.py`](coding-agents/pr_review/handler.py);
+its prompt is where your team's checklist goes.
+
+## Go further: a team that checks its own work
+
+The same Runtime pattern serves Codex and Kiro, and a coordinator turns them into
+a team. You ask for a change and get back a pull request that a separate agent
+tested and an independent review read. Then you decide whether to merge.
 
 <p align="center">
   <picture>
@@ -23,18 +69,8 @@ and an independent review read. Then you decide whether to merge.
 </p>
 <p align="center"><sub>Real screens from one live workshop event, in loop order. Nothing is mocked.</sub></p>
 
-## Why this exists
-
-A coding agent on a laptop is one person, one session, one machine. A team needs
-more: agents that run where everyone can reach them, work that is checked by
-something other than the agent that wrote it, and a record of who asked for what.
-This repository is a complete, working example of that on Amazon Bedrock AgentCore.
-
-## The idea: build the loop
-
-**Discover → Plan → Execute → Verify → Iterate.** You stop steering each step and
-build the loop that does it. A loop is only as good as its verify step, so every
-choice here protects it.
+**Discover → Plan → Execute → Verify → Iterate.** A loop is only as good as its
+verify step, so every choice here protects it.
 
 - **The maker is never the checker.** Builders write code. A different agent, in its
   own Runtime with its own instructions, decides whether it works.
@@ -45,31 +81,14 @@ choice here protects it.
   once, on the same pull request. Then the loop stops and hands you the evidence.
 - **Skills, not scripts.** Agents read principle-based skills and choose their own
   files, language, and structure. Nothing in this repository encodes the answer.
-- **Memory outside the chat.** Every build leaves pull requests, check results, and
-  a saved record, so the next loop starts where the last one stopped.
-
-## How it works
 
 <p align="center"><img src="docs/assets/how-it-works.svg" width="100%" alt="Build row: you ask, the coordinator on AgentCore Runtime plans and routes, Claude Code and Codex build in their own Runtimes, and each opens one pull request through AgentCore Gateway. Verify row: Kiro writes a check in its own Runtime, the engine runs it for real, an independent review tries to break it, and you merge. A red check goes back to its builder once, then to you."></p>
 
-- **A team, not a single tool.** Claude Code builds services, Codex builds
-  interfaces, and Kiro checks the work. Each runs in its own AgentCore Runtime
-  session, sharing an Amazon S3 Files workspace. Choose a different roster with one
-  setting, no code change.
-- **A coordinator that keeps working.** A Strands agent on AgentCore Runtime reads
-  your repository, sends work only to the builders a request needs, and finishes
-  the build after you close your laptop.
-- **GitHub without handing out keys.** A GitHub App sits behind AgentCore Gateway.
-  Agents get pull requests, never a GitHub credential. Kiro's key stays in
-  AgentCore Identity.
-- **Who asked, and what it used.** People sign in with Amazon Cognito. Their
-  identity travels with the work into OpenTelemetry, so Amazon CloudWatch shows
-  usage per person and per agent.
-
 ## Agent Studio
 
-A browser console for the whole loop, included in [`console/`](console). Labs 1
-and 2 use the terminal; Lab 3 brings the same work into Agent Studio.
+A browser console for the whole loop, included in [`console/`](console). The core
+workshop uses the terminal; the Agent Studio track brings the same work into a
+browser, with usage and controls per person.
 
 | Workspace | Governance |
 |---|---|
@@ -103,22 +122,22 @@ and 2 use the terminal; Lab 3 brings the same work into Agent Studio.
 
 **At AWS re:Invent 2026 (AIM416) or another AWS event:** your account, a
 browser-based VS Code, and this repository are ready. Open the workshop and start
-at Lab 1.
+with Get in.
 
 **In your own AWS account:** launch the workshop stack in one region, then follow
-the same labs. You need Amazon Bedrock model access, a GitHub account, and a Kiro
-subscription for the checker.
+the same pages. You need Amazon Bedrock access to Claude Sonnet 5, and a GitHub account
+for part 3.
 
 <p>
   <a href="https://us-west-2.console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/create/review?templateURL=https://ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0.s3.us-west-2.amazonaws.com/7b1cc169-b7a2-4a64-b215-df050bd8c8f1/cfn.yaml&stackName=coding-agents-workshop&param_AssetsBucketName=ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0&param_AssetsBucketPrefix=7b1cc169-b7a2-4a64-b215-df050bd8c8f1"><img src="docs/assets/launch-stack.svg" alt="Launch Stack"></a>&nbsp; US West (Oregon), recommended<br>
   <a href="https://us-east-1.console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?templateURL=https://ws-assets-prod-iad-r-iad-ed304a55c2ca1aee.s3.us-east-1.amazonaws.com/7b1cc169-b7a2-4a64-b215-df050bd8c8f1/cfn.yaml&stackName=coding-agents-workshop&param_AssetsBucketName=ws-assets-prod-iad-r-iad-ed304a55c2ca1aee&param_AssetsBucketPrefix=7b1cc169-b7a2-4a64-b215-df050bd8c8f1"><img src="docs/assets/launch-stack.svg" alt="Launch Stack"></a>&nbsp; US East (N. Virginia)
 </p>
 
-| Lab | You do | You learn |
+| Part | You do | You learn |
 |---|---|---|
-| **1. Build your coding team** | Deploy Claude Code to AgentCore Runtime, then open a shell in each agent | Agents on Runtime, one shared workspace, keys kept in AgentCore Identity |
-| **2. Coordinate a build** | Connect GitHub, deploy the coordinator, ask for a game, then play it | The loop: one pull request per builder, a real check, an independent review |
-| **3. Improve and govern** | Turn a play-test note into a fix from Agent Studio, then trace it | Identity and usage per person, policy checks, and the audit trail |
+| **1. Close the lid** | Deploy Claude Code, give it a task, detach, come back | A session is a microVM in the cloud, so it outlives your laptop |
+| **2. Twenty at once** | Send one job to twenty agents with one command | More sessions are more microVMs, so parallel is a loop, not a fleet |
+| **3. It wakes up** | Connect a repository and open a pull request | An event can start a session, so the agent works without you |
 
 Lost at any point? One read-only command says where you are and what to run next:
 
@@ -126,15 +145,15 @@ Lost at any point? One read-only command says where you are and what to run next
 python3 orchestrator/progress.py
 ```
 
-In your own account, finish with the workshop's cleanup steps. The Runtimes you
-deploy in the labs are not part of the stack, and the host, Runtimes, Gateway, and
-NAT gateway are billed while they exist.
+When you finish, `./connect.sh --stop` ends your session. In your own account,
+follow the workshop's cleanup steps: the host, Runtimes, Gateway, and NAT gateway
+are billed while they exist.
 
 ## What's in the repository
 
 | Folder | What it holds |
 |---|---|
-| [`coding-agents/`](coding-agents) | One folder per agent (container, steering, deploy and connect), plus the GitHub Gateway |
+| [`coding-agents/`](coding-agents) | One folder per agent (container, steering, deploy), `connect.sh`, `fanout.py`, the pull request reviewer, and the GitHub Gateway |
 | [`orchestrator/`](orchestrator) | The loop: routing, dispatch, checks, review, GitHub, and saved run records |
 | [`orchestrator-agent/`](orchestrator-agent) | The coordinator, packaged for AgentCore Runtime |
 | [`console/`](console) | Agent Studio (React and FastAPI) |

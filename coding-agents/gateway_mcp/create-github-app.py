@@ -244,7 +244,8 @@ class SetupSession:
             raise SetupError("A key already exists. Finish its App with --app-id and --key-file.")
         now = time.time()
         name = f"AgentCore GitHub MCP {secrets.token_hex(3)}"
-        manifest = build_manifest(base_url, port, name, public)
+        webhook_url = resolve_webhook_url()
+        manifest = build_manifest(base_url, port, name, public, webhook_url)
         session = cls(STATE_FILE, {
             "version": 1, "phase": "awaiting_callback",
             "state": secrets.token_urlsafe(24), "name": name,
@@ -252,7 +253,7 @@ class SetupSession:
             "key_file": str(key_path), "checkout": str(REPO_ROOT.resolve()),
             "created_at": now, "expires_at": now + MANIFEST_LIFETIME_S,
             "manifest": manifest, "manifest_sha256": manifest_digest(manifest),
-            "public": public, "organization": organization,
+            "public": public, "organization": organization, "webhook_url": webhook_url,
         })
         session.save()
         return session
@@ -274,8 +275,12 @@ class SetupSession:
                 and (data.get("organization") is None or bool(
                     isinstance(data["organization"], str)
                     and re.fullmatch(r"[A-Za-z0-9-]+", data["organization"])))
+                and (data.get("webhook_url") is None or bool(
+                    isinstance(data["webhook_url"], str)
+                    and data["webhook_url"].startswith("https://")))
                 and data["manifest"] == build_manifest(data["base_url"], data["port"], data["name"],
-                                                       data.get("public", False))
+                                                       data.get("public", False),
+                                                       data.get("webhook_url"))
                 and manifest_digest(data["manifest"]) == data["manifest_sha256"]
                 and all(type(data[key]) in (int, float) and math.isfinite(data[key])
                         for key in ("created_at", "expires_at"))
@@ -332,7 +337,7 @@ class SetupSession:
         if hashlib.sha256(pem.encode()).hexdigest() != self.data["key_sha256"]:
             raise SetupError("Saved key evidence changed; no file was overwritten.")
         atomic_private_write(key_path, pem.encode(), replace=False)
-        return {**app, "pem": pem}
+        return {**app, "pem": pem, "webhook_secret": self.data.get("webhook_secret")}
 
     def receive(self, code: str, state: str) -> dict:
         with self.lock:
@@ -372,7 +377,9 @@ class SetupSession:
             created = github("POST", f"/app-manifests/{quote(code, safe='')}/conversions",
                              timeout=min(30, remaining))
             app_id, slug, pem = str(created["id"]), created["slug"], created["pem"]
+            webhook_secret = created.get("webhook_secret")
             if (not re.fullmatch(r"[1-9][0-9]*", app_id)
+                    or (webhook_secret is not None and not isinstance(webhook_secret, str))
                     or not isinstance(slug, str) or not re.fullmatch(r"[A-Za-z0-9-]+", slug)
                     or not isinstance(pem, str) or not pem.strip()):
                 raise ValueError("Invalid conversion result")
@@ -399,6 +406,7 @@ class SetupSession:
             self.data = {
                 **previous, "phase": "converted", "app": {"id": app_id, "slug": slug},
                 "pem": pem, "key_sha256": hashlib.sha256(pem.encode()).hexdigest(),
+                "webhook_secret": webhook_secret,
             }
             try:
                 self.save()  # Save the one-time response before any browser acknowledgement.
@@ -415,7 +423,7 @@ class SetupSession:
 
     def complete(self, installation_id: str) -> None:
         self.data.update(phase="complete", installation_id=installation_id)
-        for key in ("state", "pem", "code_sha256"):
+        for key in ("state", "pem", "code_sha256", "webhook_secret"):
             self.data.pop(key, None)
         self.save()
 
@@ -423,6 +431,26 @@ class SetupSession:
 def fail(message: str) -> "None":
     print(f"ERROR: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def resolve_webhook_url() -> str | None:
+    """The stack's pull request review endpoint, or None when this stack has none.
+
+    WORKSHOP_WEBHOOK_URL wins; otherwise the SSM parameter the stack publishes. A
+    missing endpoint keeps the App's webhook inactive rather than failing setup.
+    """
+    explicit = os.environ.get("WORKSHOP_WEBHOOK_URL", "").strip()
+    if explicit:
+        return explicit if explicit.startswith("https://") else None
+    try:
+        out = subprocess.run(
+            ["aws", "ssm", "get-parameter", "--name", "/workshop/webhook-url",
+             "--query", "Parameter.Value", "--output", "text"],
+            capture_output=True, text=True, timeout=20, check=True)
+        value = out.stdout.strip()
+        return value if value.startswith("https://") else None
+    except (subprocess.SubprocessError, OSError):
+        return None
 
 
 def resolve_base_url(explicit: str | None) -> str:
@@ -503,13 +531,17 @@ def github(method: str, path: str, token: str | None = None, *, timeout: float =
     return outcome["result"]
 
 
-def build_manifest(base_url: str, port: int, name: str, public: bool = False) -> dict:
+def build_manifest(base_url: str, port: int, name: str, public: bool = False,
+                   webhook_url: str | None = None) -> dict:
     """The App this workshop needs, and nothing more.
 
     These four permissions are exactly what the Gateway's tools use: read and write
     file contents to push a branch, issues to comment gate and review evidence, pull
-    requests to open and merge them, and metadata because GitHub requires it. The
-    webhook is registered inactive because nothing in this workshop listens for one;
+    requests to open and merge them, and metadata because GitHub requires it.
+
+    With a ``webhook_url`` (the stack's review endpoint), the App subscribes to pull
+    request events and GitHub signs each delivery with the webhook secret it returns
+    on conversion. Without one the webhook is registered inactive, because
     `hook_attributes.url` is required by the manifest schema even so.
 
     The App is private unless --public is chosen. Some GitHub accounts reject a
@@ -527,8 +559,9 @@ def build_manifest(base_url: str, port: int, name: str, public: bool = False) ->
             "pull_requests": "write",
             "metadata": "read",
         },
-        "default_events": [],
-        "hook_attributes": {"url": f"{base_url}/proxy/{port}/webhook", "active": False},
+        "default_events": ["pull_request"] if webhook_url else [],
+        "hook_attributes": ({"url": webhook_url, "active": True} if webhook_url
+                            else {"url": f"{base_url}/proxy/{port}/webhook", "active": False}),
     }
 
 
@@ -828,12 +861,15 @@ def read_key(path: Path) -> str:
         raise SetupError(f"Could not read the private key at {path}.") from None
 
 
-def write_env(app_id: str, key_path: Path, installation_id: str) -> None:
+def write_env(app_id: str, key_path: Path, installation_id: str,
+              webhook_secret: str | None = None) -> None:
+    secret_line = (f"export GITHUB_APP_WEBHOOK_SECRET={shlex.quote(webhook_secret)}\n"
+                   if webhook_secret else "")
     atomic_private_write(ENV_FILE, (
         "# Written by create-github-app.py. Source it, then run ./deploy-all.sh\n"
         f"export GITHUB_APP_ID={app_id}\n"
         f"export GITHUB_APP_PRIVATE_KEY_FILE={shlex.quote(str(key_path))}\n"
-        f"export GITHUB_APP_INSTALLATION_ID={installation_id}\n").encode())
+        f"export GITHUB_APP_INSTALLATION_ID={installation_id}\n" + secret_line).encode())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -899,11 +935,13 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     created = wait_for_callback(session, resuming=args.resume)
                 app_id, pem = created["id"], created["pem"]
+                webhook_secret = created.get("webhook_secret")
                 print(f"App id {app_id}; private key saved at {key_path}")
                 print(f'Install this App: https://github.com/apps/{created["slug"]}/installations/new')
             owner = repo.split("/")[0] if repo and "/" in repo else None
             installation_id = wait_for_installation(app_id, pem, owner)
-            write_env(app_id, key_path, installation_id)
+            write_env(app_id, key_path, installation_id,
+                      webhook_secret if session is not None else None)
             if session is not None:
                 session.complete(installation_id)
     except SetupError as exc:
