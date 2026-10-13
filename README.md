@@ -36,16 +36,21 @@ cd coding-agents
 
 **2. Twenty at once.** One command sends the same job to one agent per
 repository. Each agent is a new session, so each is an isolated microVM; a live
-board shows them work, and the host checks every change by calling it.
+board shows them work, and the host checks every change by calling it. Prove the
+isolation by hand first: a note written in session A is invisible from session B.
 
 ```bash
-python3 fanout.py --agents 20
+python3 session.py A 'echo hi > /tmp/note'; python3 session.py B 'cat /tmp/note'
+python3 fanout.py --agents 20              # or --task "..." for a job of your own
 ```
 
 **3. It wakes up.** Connect a GitHub repository and open a pull request. GitHub's
 event reaches an endpoint in your stack, which starts a new session that reviews
-the diff and posts the review on the pull request. The agent never holds a
-GitHub token: comments go through AgentCore Gateway.
+the change, runs the code to prove what it finds, and posts the review on the pull
+request. Add `REVIEW.md` to the base branch to set your team's rules; comment
+`/fix` and a fixer session opens a fix pull request that a different session
+reviews. No agent ever holds a GitHub token: every write goes through AgentCore
+Gateway.
 
 ```bash
 ./connect-github.sh owner/repository   # two clicks on GitHub: Create, Install

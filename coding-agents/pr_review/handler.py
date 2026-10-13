@@ -1,28 +1,40 @@
-"""Wake a Claude Code session on AgentCore Runtime when a pull request opens.
+"""Wake a Claude Code session on AgentCore Runtime when a pull request needs an agent.
 
-GitHub calls this function's HTTP endpoint for every pull request event of the
-workshop App. The function checks GitHub's signature, answers within a second, and
-hands the work to an asynchronous copy of itself. That copy:
+GitHub calls this function's HTTP endpoint for every event of the workshop App. The
+function checks GitHub's signature, answers within a second, and hands the work to an
+asynchronous copy of itself. Two events start work:
+
+* A pull request is opened, reopened, updated, or marked ready: a **reviewer** session.
+* A trusted person comments ``/fix`` on a pull request: a **fixer** session, which opens
+  a follow-up pull request against that branch. That pull request is an event too, so a
+  different reviewer session reviews the fix: the maker is never the checker.
+
+For each job the copy:
 
 1. finds the attendee's Claude Code Runtime (``claude_code``) and the GitHub Gateway,
 2. posts "an agent woke up" on the pull request,
-3. reads the pull request's diff through the Gateway,
-4. starts a NEW Runtime session (its own microVM) that reviews the diff with Claude Code,
-5. posts that review back to the pull request through the Gateway.
+3. reads the change through the Gateway: the diff, the changed files at the head commit,
+   and the repository's review rules (``REVIEW.md`` on the base branch, so a pull request
+   cannot rewrite the rules it is judged by),
+4. starts a NEW Runtime session (its own microVM) with that bundle; the agent may run the
+   code there, because the microVM is discarded afterwards,
+5. posts the result back through the Gateway.
 
-The GitHub credential never enters the Runtime: the Gateway's GitHub tools hold it,
-and the session only receives the diff text. The author of a change is never its
-reviewer, because the review runs in a fresh session that wrote none of the code.
+The GitHub credential never enters the Runtime: the Gateway's GitHub tools hold it, and
+the session receives files, not a token.
 """
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
 import shlex
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -32,19 +44,42 @@ SECRET_ID = "agentcore/github-mcp/github-app"
 GATEWAY_NAME = "github-mcp-gateway"
 RUNTIME_NAME = "claude_code"
 TARGET = "GitHubMCP"
-MAX_DIFF_BYTES = 40_000  # base64 grows it by a third; one command allows 65,536 characters
+RULES_FILE = "REVIEW.md"
 ACTIONS = {"opened", "reopened", "synchronize", "ready_for_review"}
+# Who may ask for a fix: people with write access, never a bot (so an agent's own
+# comment can never start another agent).
+TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}
+# One InvokeAgentRuntimeCommand command allows 65,536 characters. The bundle is a
+# base64 tar.gz of the diff, the changed files and the rules; the prompt takes the rest.
+MAX_BUNDLE_CHARS = 52_000
+MAX_DIFF_BYTES = 40_000
+MAX_SOURCE_BYTES = 120_000
 BEGIN, END = "===REVIEW-BEGIN===", "===REVIEW-END==="
+FILES_BEGIN, FILES_END = "===FILES-BEGIN===", "===FILES-END==="
+REVIEW_HEADING = "### Review from Claude Code on Amazon Bedrock AgentCore Runtime"
 
-PROMPT = (
-    "You are a careful code reviewer, working alone in this microVM. The file "
-    "/tmp/review/pr.diff holds pull request #{number} \"{title}\" by {author} in {repo}. "
-    "Each added or unchanged line starts with its line number in the new file. Read it, "
-    "then write the review in GitHub Markdown: a one-sentence summary; then at most five "
-    "findings, each a definite problem you can show from the diff, naming the file and "
-    "line, why it matters, and a concrete fix, in one or two sentences; then a final line "
-    "that is exactly 'Verdict: looks good' or 'Verdict: needs changes'. Skip anything you "
-    "are unsure of and do not restate the diff. Print only the review."
+REVIEW_PROMPT = (
+    "You are reviewing pull request #{number} \"{title}\" by {author} in {repo}, alone in a "
+    "microVM that is discarded when you finish. In this folder: pr.diff (each added or "
+    "unchanged line starts with its line number in the new file), src/ (the changed files as "
+    "of the pull request's head commit), and RULES.md (the repository's review rules from "
+    "its base branch; it may be empty). You may run the code in src/ to prove a problem. "
+    "Write the review in GitHub Markdown: a one-sentence summary; then at most five findings, "
+    "each a definite problem naming the file by its repository path (without src/) and the "
+    "line, why it matters, and a concrete fix, in "
+    "one or two sentences; when you ran something to prove a finding, add the command and its "
+    "real output as one short inline code span; when a finding applies a RULES.md rule, say "
+    "which. End with a line that is exactly 'Verdict: looks good' or 'Verdict: needs changes'. "
+    "Skip anything you are unsure of and do not restate the diff. Print only the review."
+)
+FIX_PROMPT = (
+    "You are fixing pull request #{number} \"{title}\" in {repo}, alone in a microVM that is "
+    "discarded when you finish. In this folder: pr.diff (the change), src/ (the changed files "
+    "as of its head commit), REVIEW.md (the latest review of it), RULES.md (the repository's "
+    "rules; it may be empty), and REQUEST.md (what the person asked for, if anything). Fix the "
+    "problems the review lists by editing files under src/ only, keep everything else the "
+    "same, and run the code to check your fix. Then print a short Markdown list with one line "
+    "per file you changed and what you changed. Print only that list."
 )
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
@@ -61,6 +96,11 @@ def _boto():
 
 def region() -> str:
     return os.environ.get("AWS_REGION", "us-west-2")
+
+
+def log(kind: str, **fields) -> None:
+    """One line per step, so `aws logs tail` reads like a live feed of the agent waking."""
+    print(f"{kind} " + json.dumps(fields, default=str), flush=True)
 
 
 def response(status: int, message: str) -> dict:
@@ -86,21 +126,35 @@ def signature_ok(secret: str, body: bytes, header: str) -> bool:
 
 
 def job_from_event(kind: str, payload: dict) -> dict | None:
-    """The review job for a pull request event, or None when it needs no review."""
-    if kind != "pull_request" or payload.get("action") not in ACTIONS:
-        return None
-    pr = payload.get("pull_request") or {}
-    if pr.get("draft") or pr.get("state") != "open":
-        return None
-    repo = payload["repository"]
-    return {"owner": repo["owner"]["login"], "repo": repo["name"], "number": pr["number"],
-            "title": pr.get("title", ""), "author": (pr.get("user") or {}).get("login", ""),
-            "sha": pr["head"]["sha"]}
+    """The job an event asks for, or None when it needs no agent."""
+    repo = payload.get("repository") or {}
+    where = {"owner": (repo.get("owner") or {}).get("login", ""), "repo": repo.get("name", "")}
+    if kind == "pull_request":
+        if payload.get("action") not in ACTIONS:
+            return None
+        pr = payload.get("pull_request") or {}
+        if pr.get("draft") or pr.get("state") != "open":
+            return None
+        return {"mode": "review", **where, "number": pr["number"], "title": pr.get("title", ""),
+                "author": (pr.get("user") or {}).get("login", ""), "sha": pr["head"]["sha"]}
+    if kind == "issue_comment":
+        issue, comment = payload.get("issue") or {}, payload.get("comment") or {}
+        body = (comment.get("body") or "").strip()
+        if (payload.get("action") != "created" or "pull_request" not in issue
+                or not body.lower().startswith("/fix")):
+            return None
+        user = comment.get("user") or {}
+        if user.get("type") == "Bot" or comment.get("author_association") not in TRUSTED:
+            return None
+        return {"mode": "fix", **where, "number": issue["number"], "title": issue.get("title", ""),
+                "author": user.get("login", ""), "request": body[4:].strip()}
+    return None
 
 
 def handler(event, context):
-    if "review" in event:
-        return review(event["review"])
+    if "job" in event or "review" in event:
+        job = event.get("job") or {"mode": "review", **event["review"]}
+        return fix(job) if job.get("mode") == "fix" else review(job)
     headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
     body = event.get("body") or ""
     raw = base64.b64decode(body) if event.get("isBase64Encoded") else body.encode()
@@ -108,18 +162,23 @@ def handler(event, context):
     if not secret:
         return response(503, "No webhook secret yet: connect the repository first.")
     if not signature_ok(secret, raw, headers.get("x-hub-signature-256", "")):
+        log("REJECTED", reason="signature")
         return response(401, "Signature does not match this App's webhook secret.")
     kind = headers.get("x-github-event", "")
     if kind == "ping":
         return response(200, "pong")
-    job = job_from_event(kind, json.loads(raw or b"{}"))
+    payload = json.loads(raw or b"{}")
+    job = job_from_event(kind, payload)
     if job is None:
         return response(202, f"Ignored {kind} event.")
     job["received_at"] = time.time()
+    log("EVENT", event=kind, action=payload.get("action"), repo=f"{job['owner']}/{job['repo']}",
+        number=job["number"], mode=job["mode"])
     _boto().client("lambda", region_name=region()).invoke(
         FunctionName=context.invoked_function_arn, InvocationType="Event",
-        Payload=json.dumps({"review": job}).encode())
-    return response(202, "An agent is waking up to review this pull request.")
+        Payload=json.dumps({"job": job}).encode())
+    verb = "fix" if job["mode"] == "fix" else "review"
+    return response(202, f"An agent is waking up to {verb} this pull request.")
 
 
 # ---------------- Gateway (SigV4-signed MCP JSON-RPC) ----------------
@@ -137,7 +196,9 @@ def gateway_url() -> str:
             raise RuntimeError(f"Gateway {GATEWAY_NAME} not found; run the connect step first")
 
 
-def tool(url: str, name: str, arguments: dict):
+def tool(url: str, name: str, arguments: dict, *, raw: bool = False):
+    """Call one GitHub tool through the Gateway. ``raw`` keeps a text result as text,
+    so a file that happens to be JSON is not parsed."""
     from botocore.auth import SigV4Auth
     from botocore.awsrequest import AWSRequest
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -152,19 +213,24 @@ def tool(url: str, name: str, arguments: dict):
         payload = json.loads(r.read().decode() or "{}")
     if "error" in payload:
         raise RuntimeError(f"{name}: {payload['error']}")
-    for block in (payload.get("result") or {}).get("content", []):
+    result = payload.get("result") or {}
+    if result.get("isError"):
+        raise RuntimeError(f"{name}: {json.dumps(result.get('content'))[:300]}")
+    for block in result.get("content", []):
         if block.get("type") == "text":
             text = block.get("text", "")
             if text.lower().startswith(("error calling tool", "error executing tool")):
                 raise RuntimeError(f"{name}: {text[:300]}")
+            if raw:
+                return text
             try:
                 return json.loads(text)
             except ValueError:
                 return text
-    return payload.get("result")
+    return result
 
 
-# ---------------- The review session ----------------
+# ---------------- What the session receives ----------------
 
 def runtime_arn() -> str:
     control = _boto().client("bedrock-agentcore-control", region_name=region())
@@ -210,16 +276,67 @@ def build_diff(pr: dict) -> str:
     return diff
 
 
-def build_command(job: dict, diff: str) -> str:
-    prompt = PROMPT.format(number=job["number"], title=job["title"].replace('"', "'"),
-                           author=job["author"], repo=f"{job['owner']}/{job['repo']}")
-    encoded = base64.b64encode(diff.encode()).decode()
+def gather(url: str, job: dict, pr: dict) -> tuple[dict[str, str], str]:
+    """The changed files at the head commit (bounded) and the base branch's rules."""
+    where = {"owner": job["owner"], "repo": job["repo"]}
+    files, total = {}, 0
+    for f in pr.get("files", []):
+        if f.get("status") == "removed":
+            continue
+        try:
+            text = tool(url, "get_file", {**where, "path": f["filename"], "ref": pr["head_sha"]}, raw=True)
+        except Exception:  # noqa: BLE001 (binary, too large, or unreadable: the diff still has it)
+            continue
+        if not isinstance(text, str) or total + len(text.encode()) > MAX_SOURCE_BYTES:
+            continue
+        size = len(text.encode())
+        files[f["filename"]] = text
+        total += size
+    try:
+        rules = tool(url, "get_file", {**where, "path": RULES_FILE, "ref": pr["base"]}, raw=True)
+    except Exception:  # noqa: BLE001 (no rules file is the common case)
+        rules = ""
+    return files, rules if isinstance(rules, str) else ""
+
+
+def bundle(entries: dict[str, str]) -> str:
+    """A base64 tar.gz of {path: text}, the one argument a session needs."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for path, text in entries.items():
+            data = text.encode()
+            info = tarfile.TarInfo(path)
+            info.size, info.mode, info.mtime = len(data), 0o644, int(time.time())
+            tar.addfile(info, io.BytesIO(data))
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def fit_bundle(diff: str, files: dict[str, str], extras: dict[str, str]) -> tuple[str, list[str]]:
+    """Bundle everything, dropping the largest source files until it fits one command."""
+    kept = dict(files)
+    dropped = []
+    while True:
+        entries = {"pr.diff": diff, **extras, **{f"src/{p}": t for p, t in kept.items()}}
+        encoded = bundle(entries)
+        if len(encoded) <= MAX_BUNDLE_CHARS or not kept:
+            return encoded, dropped
+        largest = max(kept, key=lambda p: len(kept[p]))
+        dropped.append(largest)
+        del kept[largest]
+
+
+def build_command(job: dict, encoded: str, mode: str = "review") -> str:
+    template = FIX_PROMPT if mode == "fix" else REVIEW_PROMPT
+    prompt = template.format(number=job["number"], title=job["title"].replace('"', "'"),
+                             author=job.get("author", ""), repo=f"{job['owner']}/{job['repo']}")
     script = (
-        "mkdir -p /tmp/review && cd /tmp/review && "
-        f"echo {encoded} | base64 -d > pr.diff && "
-        f"echo {BEGIN} && WORKSHOP_AGENT_WORKDIR=/tmp/review /app/run.sh --print {shlex.quote(prompt)}; "
+        "mkdir -p /tmp/work/src && cd /tmp/work && "
+        f"echo {encoded} | base64 -d | tar xzf - && "
+        f"echo {BEGIN} && WORKSHOP_AGENT_WORKDIR=/tmp/work /app/run.sh --print {shlex.quote(prompt)}; "
         f"echo {END}"
     )
+    if mode == "fix":
+        script += f"; echo {FILES_BEGIN}; tar czf - src | base64 -w0; echo; echo {FILES_END}"
     return "sh -c " + shlex.quote(script)
 
 
@@ -227,6 +344,26 @@ def extract_review(stdout: str) -> str:
     if BEGIN not in stdout:
         return ""
     return stdout.split(BEGIN, 1)[1].split(END, 1)[0].strip()
+
+
+def extract_files(stdout: str, limit: int = 4_000_000) -> dict[str, str]:
+    """The text files the fixer left under src/, keyed by repository path."""
+    if FILES_BEGIN not in stdout:
+        return {}
+    encoded = stdout.split(FILES_BEGIN, 1)[1].split(FILES_END, 1)[0].strip()
+    if not encoded or len(encoded) > limit:
+        return {}
+    out = {}
+    with tarfile.open(fileobj=io.BytesIO(base64.b64decode(encoded)), mode="r:gz") as tar:
+        for member in tar.getmembers():
+            if not member.isfile() or not member.name.startswith("src/") or ".." in member.name:
+                continue
+            data = tar.extractfile(member).read()
+            try:
+                out[member.name[len("src/"):]] = data.decode()
+            except UnicodeDecodeError:
+                continue
+    return out
 
 
 def run_session(arn: str, session: str, command: str) -> tuple[str, int | None]:
@@ -250,6 +387,8 @@ def run_session(arn: str, session: str, command: str) -> tuple[str, int | None]:
     return "".join(out), code
 
 
+# ---------------- The two jobs ----------------
+
 def review(job: dict) -> dict:
     started = time.time()
     url = gateway_url()
@@ -261,20 +400,89 @@ def review(job: dict) -> dict:
         "Its review will appear below in a minute or two.")})
     pr = tool(url, "get_pull_request_files",
               {"owner": job["owner"], "repo": job["repo"], "number": job["number"]})
-    stdout, code = run_session(runtime_arn(), session, build_command(job, build_diff(pr)))
+    files, rules = gather(url, job, pr)
+    encoded, dropped = fit_bundle(build_diff(pr), files, {"RULES.md": rules})
+    log("SESSION", mode="review", number=job["number"], session=session, files=len(files) - len(dropped),
+        rules=bool(rules))
+    stdout, code = run_session(runtime_arn(), session, build_command(job, encoded))
     text = extract_review(stdout)
     seconds = time.time() - job.get("received_at", started)
+    rules_note = f" It applied the rules in `{RULES_FILE}` on `{pr['base']}`." if rules else ""
     if code == 0 and text:
-        body = (f"### Review from Claude Code on Amazon Bedrock AgentCore Runtime\n\n{text}\n\n---\n"
+        body = (f"{REVIEW_HEADING}\n\n{text}\n\n---\n"
                 f"Reviewed commit `{job['sha'][:7]}` in a new session of its own (`{session[-12:]}`), "
-                f"{seconds:.0f} s after the pull request event. The agent read only the diff; it never "
-                "held a GitHub token.")
+                f"{seconds:.0f} s after the pull request event. The agent received the diff and "
+                f"{len(files) - len(dropped)} changed file(s) and could run them; it never held a "
+                f"GitHub token.{rules_note} Comment `/fix` to have another agent propose a fix.")
     else:
         body = (f"The review session ended without a review (exit {code}). The agent's last "
                 f"output:\n\n```\n{stdout[-1500:]}\n```")
     tool(url, "comment_on_issue", {**where, "body": body})
     result = {"repo": f"{job['owner']}/{job['repo']}", "number": job["number"], "exit": code,
-              "reviewed": bool(code == 0 and text), "seconds": round(seconds, 1), "session": session}
+              "reviewed": bool(code == 0 and text), "seconds": round(seconds, 1), "session": session,
+              "rules": bool(rules)}
     # One log line per finished review; progress.py reads it to report the review step.
-    print("REVIEW_POSTED " + json.dumps(result))
+    log("REVIEW_POSTED", **result)
+    return result
+
+
+def latest_review(comments: list) -> str:
+    for c in reversed(comments or []):
+        if (c.get("body") or "").startswith(REVIEW_HEADING):
+            return c["body"]
+    return ""
+
+
+def fix(job: dict) -> dict:
+    started = time.time()
+    url = gateway_url()
+    where = {"owner": job["owner"], "repo": job["repo"], "issue_number": job["number"]}
+    pr = tool(url, "get_pull_request_files",
+              {"owner": job["owner"], "repo": job["repo"], "number": job["number"]})
+    if not pr.get("same_repo"):
+        tool(url, "comment_on_issue", {**where, "body": (
+            "This pull request comes from a fork, so the workshop App cannot push a fix branch "
+            "for it. Push the fix from the fork instead.")})
+        return {"number": job["number"], "fixed": False, "reason": "fork"}
+    review_text = latest_review(tool(url, "list_issue_comments", where))
+    session = f"pr-fix-{job['number']}-{uuid.uuid4()}"
+    tool(url, "comment_on_issue", {**where, "body": (
+        f"**An agent just woke up** to fix this pull request, in its own microVM (session "
+        f"`{session[-12:]}`), because @{job['author']} asked. It works from the latest review "
+        "and opens a separate pull request against this branch; a different agent then reviews "
+        "that fix.")})
+    files, rules = gather(url, job, pr)
+    extras = {"RULES.md": rules, "REVIEW.md": review_text, "REQUEST.md": job.get("request", "")}
+    encoded, dropped = fit_bundle(build_diff(pr), files, extras)
+    sent = {p: t for p, t in files.items() if p not in dropped}
+    log("SESSION", mode="fix", number=job["number"], session=session, files=len(sent))
+    stdout, code = run_session(runtime_arn(), session, build_command(job, encoded, mode="fix"))
+    summary = extract_review(stdout)
+    changed = [{"path": p, "content": t} for p, t in extract_files(stdout).items() if sent.get(p) != t]
+    seconds = time.time() - job.get("received_at", started)
+    if code != 0 or not changed:
+        reason = "it changed no file" if code == 0 else f"exit {code}"
+        tool(url, "comment_on_issue", {**where, "body": (
+            f"The fix session ended without a fix ({reason}). Its last output:\n\n"
+            f"```\n{stdout[-1500:] if code else summary[-1500:]}\n```")})
+        log("FIX_FAILED", number=job["number"], exit=code, session=session)
+        return {"number": job["number"], "fixed": False, "exit": code}
+    branch = f"agent-fix-{job['number']}-{session[-6:]}"
+    tool(url, "create_branch", {"owner": job["owner"], "repo": job["repo"], "branch": branch,
+                                "from_branch": pr["head_ref"]})
+    tool(url, "put_files", {"owner": job["owner"], "repo": job["repo"], "branch": branch,
+                            "files": changed, "message": f"Fix the review findings on #{job['number']}"})
+    opened = tool(url, "create_pull_request", {
+        "owner": job["owner"], "repo": job["repo"], "head": branch, "base": pr["head_ref"],
+        "title": f"Fix the review findings on #{job['number']}",
+        "body": (f"{summary}\n\n---\nWritten by a fixer session (`{session[-12:]}`) on Amazon "
+                 f"Bedrock AgentCore Runtime, {seconds:.0f} s after @{job['author']} asked on "
+                 f"#{job['number']}. A different session reviews this pull request; merge it into "
+                 f"`{pr['head_ref']}` when you agree.")})
+    tool(url, "comment_on_issue", {**where, "body": (
+        f"Opened #{opened['number']} with the proposed fix ({len(changed)} file(s)). A different "
+        "agent is reviewing it now.")})
+    result = {"repo": f"{job['owner']}/{job['repo']}", "number": job["number"], "fix_pr": opened["number"],
+              "files": len(changed), "seconds": round(seconds, 1), "session": session}
+    log("FIX_OPENED", **result)
     return result

@@ -72,7 +72,8 @@ def test_a_signed_pull_request_is_handed_off_and_answered_at_once(lam):
     r = call(pr_event(), "pull_request")
     assert r["statusCode"] == 202 and len(lam.calls) == 1
     assert lam.calls[0]["InvocationType"] == "Event"
-    job = json.loads(lam.calls[0]["Payload"])["review"]
+    job = json.loads(lam.calls[0]["Payload"])["job"]
+    assert job["mode"] == "review"
     assert (job["owner"], job["repo"], job["number"], job["sha"]) == ("octo", "game", 7, "abc1234def")
 
 
@@ -97,16 +98,67 @@ def test_no_secret_means_refuse_never_accept_unsigned(lam, monkeypatch):
     assert lam.calls == []
 
 
-def test_a_large_diff_is_cut_to_fit_one_command():
-    big = {"files": [{"filename": f"f{i}.py", "status": "modified", "additions": 1, "deletions": 0,
-                      "patch": "+" + "x" * 5000} for i in range(30)]}
-    diff = hook.build_diff(big)
-    assert len(diff.encode()) < 41_000 and "truncated" in diff
+def fix_comment(body="/fix please", association="OWNER", user_type="User", on_pr=True):
+    issue = {"number": 7, "title": "Add pause"}
+    if on_pr:
+        issue["pull_request"] = {"url": "x"}
+    return {"action": "created", "repository": {"name": "game", "owner": {"login": "octo"}},
+            "issue": issue, "comment": {"body": body, "author_association": association,
+                                        "user": {"login": "dev", "type": user_type}}}
+
+
+def test_a_trusted_fix_comment_starts_a_fixer(lam):
+    assert call(fix_comment("/fix keep it short"), "issue_comment")["statusCode"] == 202
+    job = json.loads(lam.calls[0]["Payload"])["job"]
+    assert job["mode"] == "fix" and job["number"] == 7 and job["request"] == "keep it short"
+
+
+def test_untrusted_bot_and_ordinary_comments_start_nothing(lam):
+    for event in (fix_comment(association="NONE"), fix_comment(user_type="Bot"),
+                  fix_comment(body="looks good"), fix_comment(on_pr=False)):
+        assert call(event, "issue_comment")["statusCode"] == 202
+    assert lam.calls == [], "only a person with write access can wake a fixer"
+
+
+def test_the_bundle_round_trips_and_fits_one_command():
+    files = {f"src{i}.py": "x = 1\n" * 4000 + f"# {i}\n" for i in range(12)}
+    encoded, dropped = hook.fit_bundle("+x", files, {"RULES.md": "Use Decimal for money."})
+    assert len(encoded) <= hook.MAX_BUNDLE_CHARS
     job = {"owner": "octo", "repo": "game", "number": 7, "title": 'Add "pause" mode', "author": "dev"}
-    command = hook.build_command(job, diff)
-    assert len(command) < 65_536, "InvokeAgentRuntimeCommand accepts at most 65,536 characters"
-    inner = shlex.split(command)[2]
-    assert "WORKSHOP_AGENT_WORKDIR=/tmp/review" in inner and hook.BEGIN in inner
+    for mode in ("review", "fix"):
+        command = hook.build_command(job, encoded, mode=mode)
+        assert len(command) < 65_536, "InvokeAgentRuntimeCommand accepts at most 65,536 characters"
+    inner = shlex.split(hook.build_command(job, encoded, mode="fix"))[2]
+    assert "WORKSHOP_AGENT_WORKDIR=/tmp/work" in inner and hook.FILES_BEGIN in inner
+    import base64 as b64, io as _io, tarfile as _tar
+    with _tar.open(fileobj=_io.BytesIO(b64.b64decode(encoded)), mode="r:gz") as tar:
+        names = set(tar.getnames())
+    assert {"pr.diff", "RULES.md"} <= names
+    assert all(f"src/{p}" in names for p in files if p not in dropped)
+
+
+def test_a_too_large_change_drops_the_largest_files_first():
+    import random
+    rnd = random.Random(7)
+    noise = lambda n: "".join(rnd.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(n))
+    files = {"big.py": noise(90_000), "small.py": "y = 2\n"}
+    encoded, dropped = hook.fit_bundle("+y", files, {})
+    assert dropped == ["big.py"] and len(encoded) <= hook.MAX_BUNDLE_CHARS
+
+
+def test_the_fixers_files_are_read_back_from_its_output():
+    out_tar = hook.bundle({"src/discount.py": "def f(): return 1\n", "src/../escape.py": "x", "notes.md": "n"})
+    stdout = f"noise\n{hook.BEGIN}\n- discount.py: fixed\n{hook.END}\n{hook.FILES_BEGIN}\n{out_tar}\n{hook.FILES_END}\n"
+    assert hook.extract_files(stdout) == {"discount.py": "def f(): return 1\n"}
+    assert hook.extract_review(stdout) == "- discount.py: fixed"
+    assert hook.extract_files("no files") == {}
+
+
+def test_the_latest_review_is_the_one_the_fixer_reads():
+    comments = [{"body": hook.REVIEW_HEADING + "\nold"}, {"body": "chat"},
+                {"body": hook.REVIEW_HEADING + "\nnew"}, {"body": "Opened #9"}]
+    assert hook.latest_review(comments).endswith("new")
+    assert hook.latest_review([]) == ""
 
 
 def test_the_diff_carries_new_file_line_numbers():

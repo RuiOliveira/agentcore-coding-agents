@@ -559,7 +559,7 @@ def build_manifest(base_url: str, port: int, name: str, public: bool = False,
             "pull_requests": "write",
             "metadata": "read",
         },
-        "default_events": ["pull_request"] if webhook_url else [],
+        "default_events": ["pull_request", "issue_comment"] if webhook_url else [],
         "hook_attributes": ({"url": webhook_url, "active": True} if webhook_url
                             else {"url": f"{base_url}/proxy/{port}/webhook", "active": False}),
     }

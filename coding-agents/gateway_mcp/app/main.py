@@ -696,9 +696,10 @@ def put_file(
 def get_pull_request_files(owner: str, repo: str, number: int) -> dict:
     """A pull request's title, author, head commit, and changed files with patches.
 
-    Returns {title, author, head_sha, base, files: [{filename, status, additions,
-    deletions, patch}]}. GitHub omits the patch of a binary or very large file; such
-    entries carry an empty patch.
+    Returns {title, author, head_sha, head_ref, same_repo, base, files: [{filename,
+    status, additions, deletions, patch}]}. ``same_repo`` is false for a pull request
+    from a fork, whose branch this App cannot write. GitHub omits the patch of a binary
+    or very large file; such entries carry an empty patch.
     """
     with httpx.Client(timeout=30) as c:
         pr = c.get(f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{number}", headers=_headers())
@@ -731,6 +732,8 @@ def get_pull_request_files(owner: str, repo: str, number: int) -> dict:
         "title": d["title"],
         "author": d["user"]["login"],
         "head_sha": d["head"]["sha"],
+        "head_ref": d["head"]["ref"],
+        "same_repo": (d["head"].get("repo") or {}).get("full_name") == d["base"]["repo"]["full_name"],
         "base": d["base"]["ref"],
         "files": files,
     }
