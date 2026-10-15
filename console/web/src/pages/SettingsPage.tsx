@@ -51,6 +51,22 @@ function SettingsModalFooter({ busy, expired, disabled, cancel, action, text }: 
   </div></Box>;
 }
 
+function SettingsModalFooter({ busy, expired, disabled, cancel, action, text }: {
+  busy: boolean; expired: boolean; disabled: boolean;
+  cancel: () => void; action: () => void; text: string;
+}) {
+  const actions = useRef<HTMLDivElement>(null);
+  // Recovery removes its focused button. Move focus before that update to a
+  // stable, non-actionable target inside this modal; never activate Save/Cancel.
+  return <Box float="right"><div ref={actions} tabIndex={-1} role="group" aria-label="Dialog actions">
+    <SpaceBetween direction="horizontal" size="xs">
+      <Button variant="link" disabled={busy} onClick={cancel}>Cancel</Button>
+      {expired && <SessionRecoveryActions beforeCheck={() => actions.current?.focus({ preventScroll: true })} />}
+      <Button variant="primary" loading={busy} disabled={disabled || expired} onClick={action}>{text}</Button>
+    </SpaceBetween>
+  </div></Box>;
+}
+
 export function SettingsPage() {
   const auth = useSyncExternalStore(authSession.subscribe, authSession.getSnapshot);
   const [search, setSearch] = useSearchParams();
