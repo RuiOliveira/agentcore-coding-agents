@@ -60,7 +60,9 @@ WEBHOOK_PARAM = "/workshop/webhook-url"
 KIRO_PROVIDER = "kiro-api-key"
 NO_KEY_CHECKER = "claude-code-validator"
 LID = "lid"
-FLEET = "fleet"
+SHARED_REPO = "lid.git"   # Lab 2: the bare repository on the mount
+GAME = "lid-game"         # Lab 2: the game, a Git repository in your home
+ARCADE = "arcade"         # Lab 2: one worktree per agent branch, and the run record
 
 # Exactly what the pages teach, copied verbatim so a pasted NEXT block runs as-is.
 # validate_content.py fails if any line here stops appearing in a page's code block.
@@ -75,6 +77,7 @@ CMD_CONNECT = [
     "cat /proc/sys/kernel/random/uuid > ~/lid-session",
     'agentcore exec --it --runtime "$ARN" --session-id "$(cat ~/lid-session)"']
 CMD_START = ["cd /mnt/s3files/lid && /app/run.sh"]
+CMD_SHARE = CMD_CD + ["python3 fanout.py --init"]
 CMD_FANOUT = CMD_CD + ["python3 fanout.py --agents 20"]
 CMD_GITHUB = CMD_CD + ["./connect-github.sh"]
 CMD_ROOT = ["cd ~/sample-amazon-bedrock-agentcore-coding-agents"]
@@ -263,14 +266,24 @@ def check_lid_work() -> dict:
 
 
 # ---------------------------------------------------------------- 2. Twenty at once
+def check_shared_repo() -> dict:
+    """fanout.py --init: ~/lid-game is a Git repository, and its bare copy is on the mount."""
+    bare = os.path.join(_mount(), SHARED_REPO)
+    if not os.path.isdir(_home(GAME, ".git")):
+        return _outcome(TODO, f"~/{GAME} is not a Git repository yet")
+    if not os.path.isfile(os.path.join(bare, "HEAD")):
+        return _outcome(TODO, f"no bare repository at {bare} yet")
+    return _outcome(DONE, f"~/{GAME} pushes to {bare}")
+
+
 def check_fanout() -> dict:
-    summary = _read_json(os.path.join(_mount(), FLEET, "fanout-summary.json"))
+    summary = _read_json(_home(ARCADE, "fanout-summary.json"))
     if not summary:
-        return _outcome(TODO, "no fan-out run yet")
-    agents, passed = summary.get("agents", 0), summary.get("passed_health", 0)
-    detail = (f"{agents} agents on {summary.get('microvms', 0)} microVMs, {passed} passed /health, "
+        return _outcome(TODO, "no agent run on the shared repository yet")
+    agents, pushed = summary.get("agents", 0), summary.get("pushed", 0)
+    detail = (f"{agents} agents on {summary.get('microvms', 0)} microVMs, {pushed} branches pushed, "
               f"{summary.get('wall_s', '?')}s wall clock")
-    return _outcome(DONE if agents and passed == agents else TODO, detail)
+    return _outcome(DONE if agents and pushed == agents else TODO, detail)
 
 
 # ---------------------------------------------------------------- 3. It wakes up
@@ -487,7 +500,11 @@ SPECS = [
     Spec(PART1, "The work it finished", check_lid_work, CMD_CONNECT + CMD_START,
          note="Connect, start Claude Code in the shared folder, give it the task on the page, "
               "then press Ctrl+] while it works."),
-    Spec(PART2, "Twenty agents", check_fanout, CMD_FANOUT),
+    Spec(PART2, "The shared repository", check_shared_repo, CMD_SHARE,
+         note="This makes ~/lid-game a Git repository and pushes it to a bare repository on the "
+              "mount, which every agent clones."),
+    Spec(PART2, "Twenty agents", check_fanout, CMD_FANOUT,
+         note="Add your rule to ~/lid-game/CLAUDE.md, then commit and push it first (step 3)."),
     Spec(PART3, "The review endpoint", check_endpoint, CMD_ENDPOINT,
          note="Package and deploy template.yaml from that folder (Lab 3, Deploy the Review Endpoint, step 1)."),
     Spec(PART3, "GitHub connected", check_github, CMD_GITHUB),

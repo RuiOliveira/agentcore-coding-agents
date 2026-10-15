@@ -154,10 +154,16 @@ class Box:
         (self.mnt / "lid" / "index.html").write_text("<canvas></canvas>")
         return self
 
-    def fanout(self, agents=10, passed=10):
-        (self.mnt / "fleet").mkdir(exist_ok=True)
-        (self.mnt / "fleet" / "fanout-summary.json").write_text(json.dumps(
-            {"agents": agents, "passed_health": passed, "microvms": agents, "wall_s": 140}))
+    def shared_repo(self):
+        (self.home / "lid-game" / ".git").mkdir(parents=True, exist_ok=True)
+        (self.mnt / "lid.git").mkdir(exist_ok=True)
+        (self.mnt / "lid.git" / "HEAD").write_text("ref: refs/heads/main\n")
+        return self
+
+    def fanout(self, agents=10, pushed=10):
+        (self.home / "arcade").mkdir(exist_ok=True)
+        (self.home / "arcade" / "fanout-summary.json").write_text(json.dumps(
+            {"agents": agents, "pushed": pushed, "microvms": agents, "wall_s": 140}))
         return self
 
 
@@ -235,9 +241,14 @@ def test_the_walk_follows_the_four_parts_in_order(box):
     step = _next(box)
     assert step.name == "The work it finished" and progress.CMD_START[0] in step.commands
     box.lid()
-    assert _next(box).commands == progress.CMD_FANOUT
-    box.fanout(passed=7)
-    assert _next(box).part == progress.PART2, "a partly green fan-out is not done"
+    step = _next(box)
+    assert step.name == "The shared repository" and step.commands == progress.CMD_SHARE
+    assert step.commands[-1] == "python3 fanout.py --init"
+    box.shared_repo()
+    step = _next(box)
+    assert step.commands == progress.CMD_FANOUT and "commit and push" in step.note
+    box.fanout(pushed=7)
+    assert _next(box).part == progress.PART2, "a run where some branches never arrived is not done"
     box.fanout()
     step = _next(box)
     assert step.name == "The review endpoint" and step.commands == progress.CMD_ENDPOINT

@@ -40,17 +40,22 @@ docker buildx bake claude-code --push      # REGISTRY=<account>.dkr.ecr.<region>
 agentcore exec --it --runtime "$ARN" --session-id "$(cat /proc/sys/kernel/random/uuid)"
 ```
 
-**Lab 2. Run Many Agents in Parallel.** One command sends the same job to one agent per
-repository. Each agent is a new session, so each is an isolated microVM. A live board
-shows them work, and the host checks every change by calling it. You check the
-isolation by hand first: a note written in session A cannot be read from session B.
-The standard every agent follows is one `CLAUDE.md`; when you edit it, the next run
-follows the new version.
+**Lab 2. Run Many Agents in Parallel.** Twenty Claude Code agents work on one
+repository at once, the way you run parallel agents on a laptop: one branch and one
+Git worktree per agent (`claude -w <name>`). Here each agent is a new session, so each
+worktree is on its own isolated microVM. You check the isolation by hand first: a note
+written in session A cannot be read from session B. `fanout.py --init` makes your Lab 1
+game a Git repository with a backlog of feature ideas and pushes it to a bare repository
+on the S3 Files mount, the only Git data there. Each session clones it to its own disk,
+runs `claude -w feature-NN` on one backlog item, and pushes that one branch. The host
+checks every branch out as a worktree under `~/arcade`, where you play them and merge the
+one you like. One rule committed to `CLAUDE.md` on `main` reaches every agent.
 
 ```bash
 agentcore exec --runtime "$ARN" --session-id "$A" "sh -c 'echo hi > /tmp/note'"
 agentcore exec --runtime "$ARN" --session-id "$B" "cat /tmp/note"   # No such file
-python3 coding-agents/fanout.py --agents 20   # or --folder arcade --task "... {repo} ... {n} ..." (writes an index)
+python3 coding-agents/fanout.py --init && python3 coding-agents/fanout.py --agents 20
+python3 coding-agents/fanout.py --repo ~/your-repo --init   # then --repo ~/your-repo --task "... {n} ..."
 ```
 
 **Lab 3. Run an Agent on Every Pull Request.** Connect a GitHub repository and open a
@@ -172,7 +177,7 @@ for Labs 3 and 4.
 | Lab | You do | You learn |
 |---|---|---|
 | **Lab 1. Run Claude Code on AgentCore Runtime** | Build Claude Code's image, create its Runtime, give it a task, disconnect, reconnect | A session is a microVM in the cloud, so it keeps running after you disconnect |
-| **Lab 2. Run Many Agents in Parallel** | Send one job to twenty agents with one command | Each new session is a new isolated microVM, so running more agents is a loop over session IDs |
+| **Lab 2. Run Many Agents in Parallel** | Run twenty agents on one repository, a branch and worktree each, then merge the one you like | Each new session is a new isolated microVM, so running more agents is a loop over session IDs |
 | **Lab 3. Run an Agent on Every Pull Request** | Deploy the endpoint, connect a repository, open a pull request | A GitHub event can start a session, and the agent never holds a GitHub token |
 | **Lab 4. Build with a Team of Agents** | Set up Kiro, then send one request to a coordinator | A separate agent writes the check, its exit code decides, and a person merges |
 

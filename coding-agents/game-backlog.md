@@ -1,6 +1,7 @@
-# Twists
+# Backlog
 
-Agent number N adds twist N to its copy of your Lab 1 game. Rewrite any line.
+Feature ideas for the game. Agent N builds item N on its own branch. Change any item,
+then commit and push before you start the agents.
 
 1. A boss that appears every ten points.
 2. Night mode with a flashlight cone around the player.
