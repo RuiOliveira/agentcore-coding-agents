@@ -45,7 +45,7 @@ must be empty in this form, so an unrelated custom request cannot silently be
 replaced. A plain custom `task` remains unchanged. The game preset asks for one
 short, complete round around one core mechanic, with clear controls, an earned
 score, an end state, and restart. Additional stages, modes, and audio are reserved
-for optional Lab 3 changes. Each game defines its own scoring and persistence
+for a later follow-up request. Each game defines its own scoring and persistence
 interface; it has no required score range or route shared with other teams.
 `integration_plan.py` must leave mechanics, visual style, controls, and
 internal design to the builder.

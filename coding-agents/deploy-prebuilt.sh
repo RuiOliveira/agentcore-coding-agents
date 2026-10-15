@@ -97,8 +97,8 @@ if ! grep -q '^ECR_URI=.\+' "${SCRIPT_DIR}/${AGENT}/agent.config" 2>/dev/null; t
   # Token Vault at session start). This keeps the ONE command working keyless.
   if [ "$AGENT" = "kiro" ] && [ -z "${KIRO_API_KEY:-}" ]; then
     echo "  No KIRO_API_KEY set; building kiro without its Token Vault identity"
-    echo "  (--skip-identity). Save your ksk_ key afterwards with Lab 1's hidden key"
-    echo "  prompt (Lab 1, Read a Harness and Store the Kiro Key, step 2); no redeploy is needed."
+    echo "  (--skip-identity). Save your ksk_ key afterwards with the hidden key"
+    echo "  prompt (Lab 4, Set Up Your Kiro API Key, step 6); no redeploy is needed."
     ( cd "${SCRIPT_DIR}/${AGENT}" && bash ./setup.sh --skip-identity )
   else
     ( cd "${SCRIPT_DIR}/${AGENT}" && bash ./setup.sh )

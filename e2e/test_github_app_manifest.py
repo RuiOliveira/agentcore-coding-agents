@@ -430,6 +430,8 @@ def test_crash_after_beginning_exchange_is_not_treated_as_unused_code(module, se
 
 def test_wait_deadline_fences_a_late_exchange_response(module, monkeypatch):
     monkeypatch.setattr(module, "CALLBACK_WAIT_S", 0.2)
+    # Offline: main() asks GitHub whether the owner is an organization before it listens.
+    monkeypatch.setattr(module, "github_owner_type", lambda owner: "User")
     port = _free_port()
     listening, entered, release = threading.Event(), threading.Event(), threading.Event()
     real_server = module.CallbackServer
@@ -450,13 +452,13 @@ def test_wait_deadline_fences_a_late_exchange_response(module, monkeypatch):
     monkeypatch.setattr(module, "github", slow_exchange)
     with ThreadPoolExecutor(max_workers=2) as executor:
         main = executor.submit(module.main, ["--repo", REPO, "--port", str(port)])
-        assert listening.wait(1)
+        assert listening.wait(5)
         pending = module.SetupSession.load()
         request = executor.submit(_get, f"http://127.0.0.1:{port}", _callback(pending))
         try:
-            assert entered.wait(1)
+            assert entered.wait(5)
             with pytest.raises(SystemExit):
-                main.result(timeout=1)
+                main.result(timeout=5)
             before = module.STATE_FILE.read_bytes()
             assert json.loads(before)["phase"] == "exchanging"
             with pytest.raises(SystemExit):

@@ -49,6 +49,40 @@ _REPO = os.path.dirname(_HERE)
 # flattens to console + interactive-api. So their parent (_ENGINES) is the
 # console dir's parent, never a hardcoded "solution" level.
 _ENGINES = os.path.dirname(_HERE)
+
+# The attendee's own clone. In the workshop the console runs from the host's platform
+# copy (PlatformFolder, /opt/workshop), while everything the attendee set up lives in
+# the clone they made in Get in: the repository and Gateway connect-github.sh saved,
+# the Gateway deploy's state, and any runtime_config.json a deploy.py wrote. Reading
+# the platform copy's empty .runs instead showed no repository and no Gateway.
+ATTENDEE_CLONE_NAME = "sample-amazon-bedrock-agentcore-coding-agents"
+
+
+def adopt_attendee_clone(environ=os.environ, platform_root: str = _REPO) -> str:
+    """Point the console's GitHub and harness settings at the attendee's clone.
+
+    The clone is ``WORKSHOP_ATTENDEE_CLONE``, else ``$WORKSHOP_DEV_ROOT/<repo name>``
+    (the unit sets WORKSHOP_DEV_ROOT to the attendee's home). Only unset variables are
+    filled, so an explicit setting (or a test's isolation) always wins, and nothing
+    happens when the console already runs from that clone. Returns the clone or ''."""
+    home = (environ.get("WORKSHOP_DEV_ROOT") or "").strip()
+    clone = (environ.get("WORKSHOP_ATTENDEE_CLONE") or "").strip() or (
+        os.path.join(home, ATTENDEE_CLONE_NAME) if home else "")
+    if not clone or not os.path.isdir(os.path.join(clone, "orchestrator")):
+        return ""
+    if os.path.realpath(clone) == os.path.realpath(platform_root):
+        return ""
+    environ.setdefault("WORKSHOP_GITHUB_SETTINGS",
+                       os.path.join(clone, ".runs", "github_gateway.local.json"))
+    environ.setdefault("WORKSHOP_GATEWAY_STATE",
+                       os.path.join(clone, "coding-agents", "gateway_mcp", ".deployed-state.json"))
+    environ.setdefault("WORKSHOP_CODING_AGENTS_DIR", os.path.join(clone, "coding-agents"))
+    return clone
+
+
+# Before the engine modules import: github.py reads its settings path at import.
+ATTENDEE_CLONE = adopt_attendee_clone()
+
 sys.path.insert(0, os.path.join(_ENGINES, "interactive-api"))
 sys.path.insert(0, os.path.join(_ENGINES, "orchestrator"))
 sys.path.insert(0, os.path.join(_ENGINES, "metrics-api"))

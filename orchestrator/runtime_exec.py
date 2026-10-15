@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import re
@@ -569,6 +570,48 @@ def _interactive_dispatch_commands(agent_id: str, run_subdir: str,
             "workdir": workdir, "user_id": user_id, "nonce": nonce}
 
 
+# Opening a shell starts the session's microVM when it is new, and the SDK gives the
+# WebSocket handshake websockets' default 10 s. A cold session can take longer (October
+# 13: the first dispatch after a Runtime update failed `TimeoutError: timed out during
+# opening handshake`, and the whole team build stopped with ROLE_EXECUTION_ERROR while
+# the same Runtime answered in 4 s minutes later). Nothing has been typed into a shell
+# that never opened, so a bounded retry on the SAME session and shell IDs is safe: it
+# reaches the microVM the first attempt started. Any other error is raised at once.
+CONNECT_ATTEMPTS = 3
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+def _transient_connect_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) in _RETRY_STATUS
+
+
+@contextlib.asynccontextmanager
+async def _open_shell(client: Any, runtime_arn: str, session_id: str, shell_id: str,
+                      deadline: float, sleep: Callable[[float], Any] = asyncio.sleep):
+    attempt = 0
+    while True:
+        attempt += 1
+        session = client.open_shell(runtime_arn=runtime_arn, session_id=session_id,
+                                    shell_id=shell_id)
+        try:
+            shell = await session.__aenter__()
+        except Exception as exc:  # noqa: BLE001 (re-raised unless it is transient)
+            wait = 2.0 * attempt
+            if (attempt >= CONNECT_ATTEMPTS or not _transient_connect_error(exc)
+                    or time.monotonic() + wait >= deadline):
+                raise
+            await sleep(wait)
+            continue
+        try:
+            yield shell
+        finally:
+            await session.__aexit__(None, None, None)
+        return
+
+
 async def _drive_shell(runtime_arn: str, command: str, region: str,
                        on_line: Callable[[str], None] | None,
                        timeout_s: float, session_id: str) -> dict[str, Any]:
@@ -580,8 +623,7 @@ async def _drive_shell(runtime_arn: str, command: str, region: str,
     exit_code: int | None = None
     deadline = time.monotonic() + timeout_s
 
-    async with client.open_shell(runtime_arn=runtime_arn, session_id=session_id,
-                                 shell_id=shell_id) as shell:
+    async with _open_shell(client, runtime_arn, session_id, shell_id, deadline) as shell:
         # asyncio.wait_for on EACH frame, not a check inside the loop body. The
         # deadline used to be tested only after a frame arrived, so a shell that
         # connected and then went silent blocked forever: `async for` simply never

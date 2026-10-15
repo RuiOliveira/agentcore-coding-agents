@@ -130,7 +130,9 @@ def _role_node_cls() -> Any:
 
 
 def build_graph(agent_ids: list[str], dispatch_for: Callable[[str], Callable[[], None]],
-                execution_timeout: float | None = None) -> Any:
+                execution_timeout: float | None = None,
+                checker_waits_for: set[str] | None = None,
+                after_partial: Callable[[], None] | None = None) -> Any:
     """Build the role graph for ONE run: builders in parallel, then the checker.
 
     ``dispatch_for(agent_id)`` returns the zero-arg callable that actually runs that
@@ -152,6 +154,40 @@ def build_graph(agent_ids: list[str], dispatch_for: Callable[[str], Callable[[],
     node_cls = _role_node_cls()
     nodes: dict[str, Any] = {}
     builder = GraphBuilder()
+
+    # Strands runs a graph in BATCHES: a node in the next batch starts only after the
+    # whole current batch has finished. So a checker joined to only SOME builders would
+    # still wait for the slowest one. When the checker grades only some builders now,
+    # those builders and the checker become ONE node of the entry batch (builders in
+    # parallel, then the checker), beside the builders whose checks come later.
+    partial = sorted(set(checker_waits_for or ()) & set(builders))
+    if routed_checkers and partial and len(partial) < len(builders):
+        def chain() -> None:
+            import threading
+            threads = [threading.Thread(target=dispatch_for(b), name=f"role-{b}")
+                       for b in partial]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            for checker in routed_checkers:
+                dispatch_for(checker)()
+            # The engine's deterministic finalization for whatever is already green,
+            # while the builders outside this node still work. Not a verdict here.
+            if after_partial is not None:
+                after_partial()
+        chain_id = "+".join(partial + routed_checkers)
+        nodes[chain_id] = node_cls(chain_id, chain)
+        builder.add_node(nodes[chain_id], node_id=chain_id)
+        for agent_id in builders:
+            if agent_id not in partial:
+                nodes[agent_id] = node_cls(agent_id, dispatch_for(agent_id))
+                builder.add_node(nodes[agent_id], node_id=agent_id)
+        builder.set_max_node_executions(len(nodes) + 1)
+        if execution_timeout:
+            builder.set_execution_timeout(execution_timeout)
+        return builder.build(), nodes
+
     for agent_id in agent_ids:
         node = node_cls(agent_id, dispatch_for(agent_id))
         nodes[agent_id] = node

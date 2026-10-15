@@ -495,3 +495,18 @@ def test_stream_chat_emits_keepalives_while_the_model_is_silent(monkeypatch):
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_a_team_build_under_auto_merge_reports_the_checker_starting_early(monkeypatch):
+    """October 13: the coordinator told the room the checker waits for both builders
+    while the watcher showed it start on the service under auto merge."""
+    builders = roles.builder_ids()
+    assert len(builders) >= 2, "the served roster has two builders"
+    agents = [*builders[:2], *roles.checker_ids()]
+    monkeypatch.setenv("WORKSHOP_MERGE_POLICY", "auto")
+    timing = {row["agent"]: row["timing"] for row in chat._schedule(agents)}
+    assert all("as soon as each builder's pull request can be judged" in timing[c]
+               for c in roles.checker_ids())
+    monkeypatch.setenv("WORKSHOP_MERGE_POLICY", "human_review")
+    assert all(row["timing"] == "after every selected builder finishes"
+               for row in chat._schedule(agents) if row["kind"] == roles.CHECKER)

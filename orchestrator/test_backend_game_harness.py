@@ -1,7 +1,6 @@
 """Check the game guidance delivered by image staging and Runtime archives."""
 from __future__ import annotations
 
-import importlib.util
 import io
 from pathlib import Path
 import shlex
@@ -63,28 +62,27 @@ def assert_published_browser_contract(text):
     assert "separately published copy at a public game origin" not in normalized
 
 
-def test_actual_backend_image_context_contains_game_owned_scoring(tmp_path):
-    spec = importlib.util.spec_from_file_location(
-        "backend_game_cli_versions", ROOT / "coding-agents/cli_versions.py",
-    )
-    cli = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli)
-    context = tmp_path / "backend-context"
-    cli.stage_context(ROOT / "coding-agents/claude-code", context)
-
-    staged = context / "skills/backend-engineering/SKILL.md"
-    assert staged.read_bytes() == SKILL.read_bytes()
+def test_actual_backend_image_copies_the_game_owned_scoring_skill():
+    # The image reads the skill through the "skills" named context (docker-bake.hcl and
+    # _build_push.sh both point it at harness-skills/skills), so the bytes the image gets
+    # are exactly SKILL: there is no staged copy that could drift.
+    bake = (ROOT / "docker-bake.hcl").read_text()
+    assert 'skills = "harness-skills/skills"' in bake
+    build = (ROOT / "coding-agents/_build_push.sh").read_text()
+    assert "skills=${tools_dir}/../harness-skills/skills" in build
     copies = [
-        shlex.split(line)[-2:]
-        for line in (context / "Dockerfile").read_text().splitlines()
+        shlex.split(line)
+        for line in (ROOT / "coding-agents/claude-code/Dockerfile").read_text().splitlines()
         if line.startswith("COPY ")
     ]
-    assert ["skills/", "/home/agent/skills/"] in copies
-    assert (context / "CLAUDE.md").read_bytes() == (
+    skill_copy = next(c for c in copies if "--from=skills" in c)
+    assert skill_copy[-2:] == ["backend-engineering/", "/home/agent/skills/backend-engineering/"]
+    assert (ROOT / "harness-skills/skills" / skill_copy[-2] / "SKILL.md") == SKILL
+    assert (ROOT / "coding-agents/claude-code/CLAUDE.md").read_bytes() == (
         ROOT / "orchestrator/harness/claude-code/CLAUDE.md"
     ).read_bytes()
-    assert_game_owned_scoring(staged.read_text())
-    assert_published_browser_contract(staged.read_text())
+    assert_game_owned_scoring(SKILL.read_text())
+    assert_published_browser_contract(SKILL.read_text())
 
 
 def test_actual_runtime_archive_contains_game_owned_scoring(tmp_path, monkeypatch):

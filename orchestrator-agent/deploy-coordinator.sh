@@ -72,7 +72,9 @@ role_names=$(PYTHONPATH="$REPO_ROOT/orchestrator${PYTHONPATH:+:$PYTHONPATH}" \
 for role in $role_names; do
   cfg="$REPO_ROOT/coding-agents/$role/runtime_config.json"
   arn=$(jq -r '.runtime_arn // empty' "$cfg" 2>/dev/null || true)
-  [ -n "$arn" ] || die "No Runtime ARN for $role ($cfg). Finish Lab 1 before deploying the coordinator: the coordinator must not be created before its workers exist."
+  # A Runtime built in the AgentCore console is found by its name instead.
+  [ -n "$arn" ] || arn=$(cd "$HERE" && python3 -c 'import sys, configure_deploy as c; print(c.named_runtime_arn(sys.argv[1]))' "$role" 2>/dev/null || true)
+  [ -n "$arn" ] || die "No Runtime for $role: create one named ${role//-/_} first (Build and Run the Team, step 2). The coordinator must not be created before its workers exist."
   printf '      %-12s %s\n' "$role" "$arn"
 done
 printf '      %-12s %s\n' "gateway" "$GITHUB_GATEWAY_URL"
@@ -122,13 +124,8 @@ echo
 python3 "$HERE/promote_runtime.py" --project "$PROJECT_DIR" --receipt || true
 
 echo
-# The preset here MUST match the one the Run-a-Build page tells the room to submit.
-# It used to say project-from-scratch, which is the take-home version: measured at 82
-# minutes because each pull request is gated in turn, so an attendee who followed the
-# terminal instead of the page started a build the session cannot wait for. The room's
-# build is the one-service browser game the whole room plays at the end of Lab 2.
-# Point at the page's own block instead of printing a second, different command: the
-# page's version prints the session ID the attendee needs later (clarifying answers,
-# status, and Clean Up), and a terminal command here invited a second submission.
-echo "Coordinator deployed. Next: submit your build with step 1 of Run a Build and Follow It."
-echo "  It creates and prints the session ID you will reuse; submit only once."
+# The request here MUST match the one the page tells the room to submit. ask.sh keeps
+# one conversation per host, and the coordinator refuses a duplicate of a build that is
+# still running, so printing the command cannot start a second build by accident.
+echo "Coordinator deployed. Next, send your request (Build and Run the Team, step 6):"
+echo "  ./ask.sh \"Use preset=team-game. Creative direction: <your idea, in one sentence>\""

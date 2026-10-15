@@ -272,3 +272,22 @@ def clear_api_key() -> dict[str, Any]:
         pass
     return {"connected": False, "source": None, "provider": _provider_name(),
             "region": _region()}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``save`` asks for the key at a hidden prompt; ``status`` reads metadata only."""
+    import argparse  # noqa: PLC0415
+    import getpass  # noqa: PLC0415
+    parser = argparse.ArgumentParser(description="Store Kiro's API key in the AgentCore Identity Token Vault.")
+    parser.add_argument("action", choices=("save", "status"))
+    args = parser.parse_args(argv)
+    if args.action == "status":
+        result = status(refresh=True)
+    else:
+        result = save_api_key(getpass.getpass("Kiro API key (hidden): "))
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 1 if result.get("error") else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -4,7 +4,8 @@
     python3 orchestrator/progress.py            # every checkpoint, then NEXT
     python3 orchestrator/progress.py --json     # the same, as JSON
 
-The workshop has three parts: close the lid, twenty at once, and it wakes up. This
+The workshop has four parts: close the lid, twenty at once, it wakes up, and a team of
+agents. This
 walks their end states IN ORDER against real local state and a few cheap, read-only
 AWS reads, prints one line per checkpoint, and ends with ONE next step: the page as
 the content titles it and the exact command that page teaches. An attendee who fell
@@ -47,27 +48,61 @@ BUDGET_S = 15.0
 DONE, TODO, UNKNOWN = "done", "todo", "unknown"
 _MARK = {DONE: "✓", TODO: "✗", UNKNOWN: "?"}
 
-GET_IN = "Get in"
-PART1 = "1. Close the lid"
-PART2 = "2. Twenty at once"
-PART3 = "3. It wakes up"
+GET_IN = "Getting Started"
+PART1 = "Lab 1. Run Claude Code on AgentCore Runtime"
+PART2 = "Lab 2. Run Many Agents in Parallel"
+PART3 = "Lab 3. Run an Agent on Every Pull Request"
+PART4 = "Lab 4. Build with a Team of Agents"
 
 SECRET_ID = "agentcore/github-mcp/github-app"
 GATEWAY_NAME = "github-mcp-gateway"
 WEBHOOK_PARAM = "/workshop/webhook-url"
+KIRO_PROVIDER = "kiro-api-key"
+NO_KEY_CHECKER = "claude-code-validator"
 LID = "lid"
 FLEET = "fleet"
 
 # Exactly what the pages teach, copied verbatim so a pasted NEXT block runs as-is.
 # validate_content.py fails if any line here stops appearing in a page's code block.
 CMD_CD = ["cd ~/sample-amazon-bedrock-agentcore-coding-agents/coding-agents"]
-CMD_DEPLOY = CMD_CD + ["./deploy-prebuilt.sh claude-code"]
-CMD_CONNECT = CMD_CD + ["./connect.sh"]
-CMD_START = ["mkdir -p /mnt/s3files/lid && cd /mnt/s3files/lid", "/app/run.sh"]
-CMD_RESUME = CMD_CD + ["./connect.sh --resume"]
-CMD_OPEN = CMD_CD + ["./open.sh /mnt/s3files/lid"]
-CMD_FANOUT = CMD_CD + ["python3 fanout.py --agents 10"]
+CMD_REGISTRY = ["export REGISTRY=$(aws sts get-caller-identity --query Account --output text)"
+                ".dkr.ecr.$AWS_REGION.amazonaws.com"]
+CMD_BUILD = ["cd ~/sample-amazon-bedrock-agentcore-coding-agents"] + CMD_REGISTRY + [
+    "docker buildx bake claude-code --push"]
+CMD_CONNECT = [
+    'ARN=$(aws bedrock-agentcore-control list-agent-runtimes --query '
+    '"agentRuntimes[?agentRuntimeName==\'claude_code\'].agentRuntimeArn" --output text)',
+    "cat /proc/sys/kernel/random/uuid > ~/lid-session",
+    'agentcore exec --it --runtime "$ARN" --session-id "$(cat ~/lid-session)"']
+CMD_START = ["cd /mnt/s3files/lid && /app/run.sh"]
+CMD_FANOUT = CMD_CD + ["python3 fanout.py --agents 20"]
 CMD_GITHUB = CMD_CD + ["./connect-github.sh"]
+CMD_ROOT = ["cd ~/sample-amazon-bedrock-agentcore-coding-agents"]
+CMD_INFRA = ["cd ~/sample-amazon-bedrock-agentcore-coding-agents && coding-agents/infra/setup.sh"]
+CMD_ENDPOINT = [
+    "cd ~/sample-amazon-bedrock-agentcore-coding-agents/coding-agents/pr_review && . ../infra.config",
+    "aws cloudformation package --template-file template.yaml --output-template-file "
+    '/tmp/pr-review.yaml --s3-bucket "$INFRA_BUCKET"',
+    "aws cloudformation deploy --template-file /tmp/pr-review.yaml --stack-name "
+    "coding-agents-pr-review --capabilities CAPABILITY_NAMED_IAM"]
+CMD_TEAM_IMAGES = ["cd ~/sample-amazon-bedrock-agentcore-coding-agents"] + CMD_REGISTRY + [
+    "docker buildx bake codex kiro --push"]
+CMD_GRANTS = [
+    "cd ~/sample-amazon-bedrock-agentcore-coding-agents/coding-agents && . infra.config",
+    'role() { basename "$(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id '
+    '"$(aws bedrock-agentcore-control list-agent-runtimes --query '
+    '"agentRuntimes[?agentRuntimeName==\'$1\'].agentRuntimeId" --output text)" '
+    '--query roleArn --output text)"; }',
+    'for n in claude_code codex kiro; do aws iam put-role-policy --role-name "$(role $n)" '
+    '--policy-name TeamRunExchange --policy-document '
+    '"$(sed "s/coding-agents-\\*/$INFRA_BUCKET/" team-exchange-policy.json)"; done']
+CONSOLE_ROLE = "AmazonBedrockAgentCoreRuntimeDefaultServiceRole-"
+CMD_KIRO_KEY = ["cd ~/sample-amazon-bedrock-agentcore-coding-agents && python3 orchestrator/kiro_config.py save"]
+CMD_COORDINATOR = ["cd ~/sample-amazon-bedrock-agentcore-coding-agents/orchestrator-agent",
+                   "WORKSHOP_MERGE_POLICY=auto ./deploy-coordinator.sh"]
+CMD_ASK = ["cd ~/sample-amazon-bedrock-agentcore-coding-agents/orchestrator-agent",
+           './ask.sh "Use preset=team-game. Creative direction: <your idea, in one sentence>"']
+CMD_WATCH = CMD_ROOT + ["python3 orchestrator/watch_run.py --plain"]
 
 _ACCOUNT_RE = re.compile(r"(?<![\w])(\d{4})\d{4}(\d{4})(?![\w])")
 _RUNTIME_ARN_RE = re.compile(
@@ -153,32 +188,57 @@ def _visible_files(path: str) -> list[str]:
 
 # ---------------------------------------------------------------- Get in
 def check_host() -> dict:
-    infra = os.path.join(_agents_dir(), "infra.config")
-    if not os.path.isfile(infra):
-        return _outcome(TODO, "this host is still being set up (no infra.config yet)")
     if not os.path.ismount(_mount()):
-        return _outcome(TODO, f"{_mount()} is not mounted yet")
+        return _outcome(TODO, f"{_mount()} is not mounted yet; the host is still setting up")
     return _outcome(DONE, f"shared folder mounted at {_mount()}")
 
 
-def check_image() -> dict:
+def check_infra() -> dict:
+    """The fresh clone records the stack's IDs with coding-agents/infra/setup.sh."""
+    if not os.path.isfile(os.path.join(_agents_dir(), "infra.config")):
+        return _outcome(TODO, "this clone has no coding-agents/infra.config yet")
+    return _outcome(DONE, "coding-agents/infra.config records the stack's network and storage")
+
+
+def check_image(repository: str = "coding-agents-claude-code") -> dict:
+    """The image the attendee built and pushed: its ``latest`` tag in their own ECR."""
     try:
-        with open(os.path.join(_agents_dir(), "claude-code", "agent.config"), encoding="utf-8") as handle:
-            line = next((l for l in handle if l.startswith("ECR_URI=")), "")
-    except OSError:
-        line = ""
-    uri = line.split("=", 1)[1].strip() if line else ""
-    if not uri:
-        return _outcome(TODO, "the stack has not finished building the Claude Code image")
-    return _outcome(DONE, "ready: " + _mask(uri.rsplit("/", 1)[-1]))
+        images = _client("ecr").describe_images(
+            repositoryName=repository, imageIds=[{"imageTag": "latest"}]).get("imageDetails", [])
+    except ImportError:
+        return _outcome(UNKNOWN, "boto3 is not installed")
+    except Exception as exc:  # noqa: BLE001
+        if _error_code(exc) in ("RepositoryNotFoundException", "ImageNotFoundException"):
+            return _outcome(TODO, f"no {repository}:latest in your ECR yet")
+        return _outcome(UNKNOWN, f"ECR unreadable ({_error_code(exc)})")
+    if not images:
+        return _outcome(TODO, f"no {repository}:latest in your ECR yet")
+    return _outcome(DONE, f"{repository}:latest " + str(images[0].get("imageDigest", ""))[:19])
 
 
 # ---------------------------------------------------------------- 1. Close the lid
+def _named_runtime_arn(name: str) -> str:
+    """A Runtime built in the console is known by its name, not by a local file."""
+    pages = _client("bedrock-agentcore-control").get_paginator("list_agent_runtimes")
+    for page in pages.paginate():
+        for runtime in page.get("agentRuntimes", []):
+            if runtime.get("agentRuntimeName") == name:
+                return runtime.get("agentRuntimeArn", "")
+    return ""
+
+
 def check_runtime() -> dict:
     arn = _read_json(os.path.join(_agents_dir(), "claude-code", "runtime_config.json")).get("runtime_arn", "")
+    if not _RUNTIME_ARN_RE.match(arn or ""):
+        try:
+            arn = _named_runtime_arn("claude_code")
+        except ImportError:
+            return _outcome(UNKNOWN, "boto3 is not installed")
+        except Exception as exc:  # noqa: BLE001
+            return _outcome(UNKNOWN, f"Runtime list unreadable ({_error_code(exc)})")
     match = _RUNTIME_ARN_RE.match(arn or "")
     if not match:
-        return _outcome(TODO, "no Claude Code Runtime yet")
+        return _outcome(TODO, "no Runtime named claude_code yet")
     try:
         status = _client("bedrock-agentcore-control").get_agent_runtime(
             agentRuntimeId=match.group(2)).get("status", "")
@@ -193,16 +253,11 @@ def check_runtime() -> dict:
     return _outcome(TODO if status.endswith("FAILED") else UNKNOWN, f"{match.group(2)} is {status}")
 
 
-def check_detached() -> dict:
-    if os.path.isfile(_home(".agentcore", "detached-claude-code")):
-        return _outcome(DONE, "you detached from a session; ./connect.sh --resume returns to it")
-    return _outcome(TODO, "no detached session recorded yet")
-
-
 def check_lid_work() -> dict:
-    files = _visible_files(os.path.join(_mount(), LID))
+    # Step 5's house rules are the attendee's own file, not work the agent finished.
+    files = [f for f in _visible_files(os.path.join(_mount(), LID)) if f != "CLAUDE.md"]
     if not files:
-        return _outcome(TODO, f"nothing in {_mount()}/{LID} yet")
+        return _outcome(TODO, f"nothing built in {_mount()}/{LID} yet")
     shown = ", ".join(files[:4]) + (", ..." if len(files) > 4 else "")
     return _outcome(DONE, f"{len(files)} file(s) in {_mount()}/{LID}: {shown}")
 
@@ -244,12 +299,28 @@ def check_github() -> dict:
     return _outcome(DONE, "App connected and its GitHub tools deployed")
 
 
+def check_endpoint() -> dict:
+    """The review endpoint the attendee deployed from pr_review/template.yaml."""
+    try:
+        url = _client("ssm").get_parameter(Name=WEBHOOK_PARAM)["Parameter"]["Value"]
+    except ImportError:
+        return _outcome(UNKNOWN, "boto3 is not installed")
+    except Exception as exc:  # noqa: BLE001
+        if _error_code(exc) == "ParameterNotFound":
+            return _outcome(TODO, "the review endpoint is not deployed yet")
+        return _outcome(UNKNOWN, f"webhook endpoint unreadable ({_error_code(exc)})")
+    host = url.split("/")[2] if url.count("/") >= 2 else url
+    return _outcome(DONE, f"deployed ({host.split('.')[0]}...)")
+
+
 def check_review() -> dict:
     try:
         url = _client("ssm").get_parameter(Name=WEBHOOK_PARAM)["Parameter"]["Value"]
     except ImportError:
         return _outcome(UNKNOWN, "boto3 is not installed")
     except Exception as exc:  # noqa: BLE001
+        if _error_code(exc) == "ParameterNotFound":
+            return _outcome(TODO, "no review endpoint yet, so nothing can wake up")
         return _outcome(UNKNOWN, f"webhook endpoint unreadable ({_error_code(exc)})")
     try:
         logs = _client("logs")
@@ -269,22 +340,175 @@ def check_review() -> dict:
     return _outcome(TODO, f"endpoint ready ({host.split('.')[0]}...); no review posted yet")
 
 
+# ---------------------------------------------------------------- 4. A team of agents
+def _project_json() -> dict:
+    return _read_json(os.path.join(_repo_root(), "CodingAgents", "agentcore", "agentcore.json"))
+
+
+def _coordinator_roles() -> str:
+    """WORKSHOP_ROLES as the coordinator was deployed with it, or "" for the default team."""
+    found: list[str] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            if node.get("name") == "WORKSHOP_ROLES" and isinstance(node.get("value"), str):
+                found.append(node["value"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(_project_json())
+    return found[0] if found else os.environ.get("WORKSHOP_ROLES", "")
+
+
+def check_checker() -> dict:
+    roles = [r.strip() for r in _coordinator_roles().split(",") if r.strip()]
+    if NO_KEY_CHECKER in roles and "kiro" not in roles:
+        return _outcome(DONE, f"this team checks with {NO_KEY_CHECKER}, which needs no Kiro key")
+    try:
+        _client("bedrock-agentcore-control").get_api_key_credential_provider(name=KIRO_PROVIDER)
+    except ImportError:
+        return _outcome(UNKNOWN, "boto3 is not installed")
+    except Exception as exc:  # noqa: BLE001
+        if _error_code(exc) == "ResourceNotFoundException":
+            return _outcome(TODO, "Kiro has no key in the Token Vault yet")
+        return _outcome(UNKNOWN, f"Token Vault unreadable ({_error_code(exc)})")
+    # Provider metadata only: GetApiKeyCredentialProvider never returns the key.
+    return _outcome(DONE, f"Kiro's key is in the Token Vault ({KIRO_PROVIDER})")
+
+
+def _runtime_arns(node) -> list[str]:
+    if isinstance(node, str):
+        return [node] if _RUNTIME_ARN_RE.match(node) else []
+    items = node.values() if isinstance(node, dict) else node if isinstance(node, list) else []
+    return [arn for value in items for arn in _runtime_arns(value)]
+
+
+def check_team_runtimes() -> dict:
+    roles = [r.strip() for r in _coordinator_roles().split(",") if r.strip()]
+    checker = NO_KEY_CHECKER if NO_KEY_CHECKER in roles and "kiro" not in roles else "kiro"
+    states = []
+    for name in ("codex", checker.replace("-", "_")):
+        try:
+            arn = _named_runtime_arn(name)
+            status = _client("bedrock-agentcore-control").get_agent_runtime(
+                agentRuntimeId=arn.rsplit("/", 1)[-1]).get("status", "") if arn else ""
+        except ImportError:
+            return _outcome(UNKNOWN, "boto3 is not installed")
+        except Exception as exc:  # noqa: BLE001
+            return _outcome(UNKNOWN, f"Runtime list unreadable ({_error_code(exc)})")
+        if status != "READY":
+            return _outcome(TODO, f"no READY Runtime named {name} yet" + (f" ({status})" if status else ""))
+        states.append(name)
+    return _outcome(DONE, " and ".join(states) + " are READY")
+
+
+def check_team_grants() -> dict:
+    """Each team Runtime's console role may trade archives under agents/runtime-exchange/."""
+    roles = [r.strip() for r in _coordinator_roles().split(",") if r.strip()]
+    checker = NO_KEY_CHECKER if NO_KEY_CHECKER in roles and "kiro" not in roles else "kiro"
+    missing = []
+    try:
+        control, iam = _client("bedrock-agentcore-control"), _client("iam")
+        for name in ("claude_code", "codex", checker.replace("-", "_")):
+            arn = _named_runtime_arn(name)
+            if not arn:
+                return _outcome(TODO, f"no Runtime named {name} yet")
+            role = control.get_agent_runtime(agentRuntimeId=arn.rsplit("/", 1)[-1])["roleArn"]
+            role = role.rsplit("/", 1)[-1]
+            if not role.startswith(CONSOLE_ROLE):
+                continue  # a role from deploy.py already reads and writes the bucket
+            try:
+                iam.get_role_policy(RoleName=role, PolicyName="TeamRunExchange")
+            except Exception as exc:  # noqa: BLE001
+                if _error_code(exc) != "NoSuchEntity":
+                    raise
+                missing.append(name)
+    except ImportError:
+        return _outcome(UNKNOWN, "boto3 is not installed")
+    except Exception as exc:  # noqa: BLE001
+        return _outcome(UNKNOWN, f"role grants unreadable ({_error_code(exc)})")
+    if missing:
+        return _outcome(TODO, "no TeamRunExchange grant yet for " + ", ".join(missing))
+    return _outcome(DONE, "every team role may trade archives under agents/runtime-exchange/")
+
+
+def check_coordinator() -> dict:
+    if not _project_json():
+        return _outcome(TODO, "no coordinator project yet")
+    state = _read_json(os.path.join(_repo_root(), "CodingAgents", "agentcore", ".cli",
+                                    "deployed-state.json"))
+    arns = [a for a in _runtime_arns(state) if "orchestrator" in a.rsplit("/", 1)[-1]]
+    if not arns:
+        return _outcome(TODO, "the coordinator project exists but is not deployed yet")
+    runtime_id = arns[0].rsplit("/", 1)[-1]
+    try:
+        status = _client("bedrock-agentcore-control").get_agent_runtime(
+            agentRuntimeId=runtime_id).get("status", "")
+    except ImportError:
+        return _outcome(UNKNOWN, f"{runtime_id} recorded; boto3 is not installed to check it")
+    except Exception as exc:  # noqa: BLE001
+        return _outcome(UNKNOWN, f"{runtime_id} recorded; status unreadable ({_error_code(exc)})")
+    if status == "READY":
+        return _outcome(DONE, f"{runtime_id} is READY")
+    return _outcome(TODO if status.endswith("FAILED") else UNKNOWN, f"{runtime_id} is {status}")
+
+
+def check_team_build() -> dict:
+    import run_store  # noqa: PLC0415 (read-only; never the engine)
+    run_store.attach_reader_mirror()
+    runs = run_store.recent(os.environ.get("WORKSHOP_RUNS_DIR")
+                            or os.path.join(_repo_root(), ".runs"), limit=5)
+    for run in runs:
+        prs = [r for r in (run.get("role_prs") or []) if isinstance(r, dict) and r.get("pr_url")]
+        if not prs:
+            continue
+        status = run.get("status") or "?"
+        detail = f"{run.get('run_id', '?')}: {len(prs)} pull request(s), {status}"
+        if status in ("passed", "needs_human", "failed"):
+            return _outcome(DONE, detail)
+        return _outcome(UNKNOWN, detail + " (still running)")
+    return _outcome(TODO, "no team build with a pull request yet")
+
+
 SPECS = [
     Spec(GET_IN, "Workshop host", check_host,
          note="The host is still setting up or the shared folder is missing. Wait a minute and "
               "run progress.py again; if it persists, ask a facilitator."),
-    Spec(GET_IN, "Claude Code image", check_image,
-         note="The stack builds this image. Wait a minute and run progress.py again."),
-    Spec(PART1, "Claude Code Runtime", check_runtime, CMD_DEPLOY),
-    Spec(PART1, "Detach and come back", check_detached, CMD_CONNECT + CMD_START,
+    Spec(GET_IN, "Your clone's infra.config", check_infra, CMD_INFRA,
+         note="Record the stack's IDs in your clone (At an AWS Guided Event, step 3)."),
+    Spec(PART1, "Claude Code image", check_image, CMD_BUILD,
+         note="First time? Create the repository and sign in to it first (Lab 1, Build the Container Image, steps 1 and 2)."),
+    Spec(PART1, "Claude Code Runtime", check_runtime,
+         note="Create it in the AgentCore console: Runtime > Create runtime, named claude_code, "
+              "with your image and Create default role (Lab 1, Create the Runtime and Open a Session, step 1)."),
+    Spec(PART1, "The work it finished", check_lid_work, CMD_CONNECT + CMD_START,
          note="Connect, start Claude Code in the shared folder, give it the task on the page, "
               "then press Ctrl+] while it works."),
-    Spec(PART1, "The work it finished", check_lid_work, CMD_RESUME + CMD_OPEN),
-    Spec(PART2, "Twenty at once", check_fanout, CMD_FANOUT),
+    Spec(PART2, "Twenty agents", check_fanout, CMD_FANOUT),
+    Spec(PART3, "The review endpoint", check_endpoint, CMD_ENDPOINT,
+         note="Package and deploy template.yaml from that folder (Lab 3, Deploy the Review Endpoint, step 1)."),
     Spec(PART3, "GitHub connected", check_github, CMD_GITHUB),
     Spec(PART3, "An agent woke up", check_review,
          note="Open a pull request in your connected repository on GitHub, then watch its "
               "conversation."),
+    Spec(PART4, "The checker's key", check_checker, CMD_KIRO_KEY,
+         note="Create your ksk_ key at app.kiro.dev, then paste it at the hidden prompt "
+              "(Lab 4, Set Up Your Kiro API Key). No Kiro seat? Step 2 of Build and Run the "
+              "Team uses a checker that needs none."),
+    Spec(PART4, "Codex and the checker", check_team_runtimes, CMD_TEAM_IMAGES,
+         note="Create their repositories, build both images, then create the Runtimes codex "
+              "and kiro in the AgentCore console (Build and Run the Team, steps 1 and 2)."),
+    Spec(PART4, "The coordinator", check_coordinator, CMD_COORDINATOR,
+         note="Add your rule to a SKILL.md first (step 3): the coordinator image carries it."),
+    Spec(PART4, "The team's grants", check_team_grants, CMD_GRANTS,
+         note="Let each team Runtime trade its source archive through the bucket, and Kiro's "
+              "role read its key (step 5). No Kiro seat? Put claude_code_validator in place "
+              "of kiro."),
+    Spec(PART4, "A team build", check_team_build, CMD_ASK + [""] + CMD_WATCH,
+         note="Send the request once, then watch it from a second terminal."),
 ]
 
 
@@ -326,7 +550,7 @@ def render(checks: list[Check]) -> str:
     step = next_step(checks)
     lines.append("")
     if step is None:
-        lines.append("All three parts are done. Next: Take it home, then Go further.")
+        lines.append("All four labs are done. Share your Play link (gallery.py status), then read Summary and Next Steps.")
         return "\n".join(lines)
     lines.append(f"NEXT ({step.part} > {step.name}):")
     if step.note:

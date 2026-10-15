@@ -190,6 +190,21 @@ def _summary_line(out: str, code: int) -> str:
     return lines[-1].strip() or f"exit {code}"
 
 
+# What an authored check inherits from the process that runs it. The check is model-written
+# code, and this process may hold credentials that can merge a pull request (the
+# coordinator's role reaches the GitHub tools), so it gets an allowlist of ordinary
+# variables and none of AWS's, GitHub's, or the engine's. It still runs on this host:
+# this keeps credentials out of its environment, it does not make it a sandbox.
+_CHECK_ENV_NAMES = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "TMPDIR", "TERM",
+                    "LD_LIBRARY_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+                    "REQUESTS_CA_BUNDLE", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "no_proxy"}
+
+
+def _check_environment() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k in _CHECK_ENV_NAMES or k.startswith("LC_")}
+
+
 def run_gate(check_path: str, work_dir: str, task: str, url: str = "") -> dict:
     """The acceptance gate: run the check the VALIDATOR ROLE authored, read its
     real exit code. That is the whole gate.
@@ -241,7 +256,7 @@ def run_gate(check_path: str, work_dir: str, task: str, url: str = "") -> dict:
     # budgeted 15-30s while the deliverable was still preparing declared
     # dependencies. Those were red gates on working services, which is the one
     # failure this file must not manufacture.
-    env = {**os.environ,
+    env = {**_check_environment(),
            "WORKSHOP_WORK_DIR": work_dir,
            "WORKSHOP_TASK": task or "",
            "WORKSHOP_GATE_TIMEOUT_S": str(GATE_TIMEOUT_S),

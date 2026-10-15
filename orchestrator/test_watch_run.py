@@ -466,7 +466,7 @@ def test_a_passed_run_says_merge_then_checkout_then_play(monkeypatch, tmp_path):
     assert "1. Open it, read its check and Assessment comments" in block
     assert "Merge pull request" in block
     assert "2. python3 orchestrator/github.py checkout ~/game\n" in block + "\n"
-    assert "Play Your Game" in block
+    assert "Play it: the README names its start command." in block
 
 
 def test_an_auto_merged_run_skips_the_merge_step(monkeypatch, tmp_path):
@@ -478,6 +478,34 @@ def test_an_auto_merged_run_skips_the_merge_step(monkeypatch, tmp_path):
     assert "merged into the default branch" in block
     assert "Merge pull request" not in block
     assert "1. python3 orchestrator/github.py checkout ~/game" in block
+
+
+def test_a_team_build_checks_out_to_the_part_4_folder_and_points_at_the_gallery(
+        monkeypatch, tmp_path):
+    """Part 4's page checks the team game out to ~/team-game; ~/game is Lab 2's."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with tempfile.TemporaryDirectory() as tmp:
+        out, _rc = _terminal(tmp, preset="team-game",
+                             role_prs=[{"work_id": "w1", "pr_url": _PR, "state": "merged"},
+                                       {"work_id": "w2", "pr_url": _PR + "0", "state": "merged"}])
+    block = out.split("what to do now", 1)[1]
+    assert "1. python3 orchestrator/github.py checkout ~/team-game" in block
+    flat = " ".join(block.split())
+    assert "Share What You Built" in flat and "Play Your Game" not in flat
+
+
+def test_a_second_team_build_never_replaces_the_first_team_checkout(monkeypatch, tmp_path):
+    """Run 5 on October 13: ~/team-game held run 4's game and the fallback named a Lab 2
+    folder with Lab 2's start advice."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "team-game").mkdir()
+    (tmp_path / "team-game" / "server.js").write_text("// run 4")
+    with tempfile.TemporaryDirectory() as tmp:
+        out, _rc = _terminal(tmp, preset="team-game",
+                             role_prs=[{"work_id": "w1", "pr_url": _PR, "state": "merged"}])
+    flat = " ".join(out.split("what to do now", 1)[1].split())
+    assert "checkout ~/team-game-abcdef" in flat and "Share What You Built" in flat
+    assert "earlier games run" not in flat
 
 
 def _blocked(error):
@@ -502,7 +530,7 @@ def test_a_red_run_offers_the_two_recoveries_the_page_teaches(monkeypatch, tmp_p
     assert "a. If you judge the game good enough" in flat
     assert "merge it yourself" in flat and "latest check comment" in flat
     assert "python3 orchestrator/github.py checkout ~/game" in block
-    assert "b. Or rerun Run a Build step 1 with a simpler direction" in flat
+    assert "b. Or rerun Build and Run the Team step 6 with a simpler direction" in flat
     assert "NEW session ID" in flat
     assert "Do not resubmit the same request to retry a red pull request" in flat
 
@@ -527,11 +555,11 @@ def test_other_stops_print_the_engines_own_advice_not_the_red_gate_choice(
     assert f"BUILD NEEDS YOU: {reason}" in flat and _PR in flat
     assert advice in flat
     assert "after its one repair" not in flat
-    assert "rerun Run a Build step 1" not in flat
+    assert "rerun Build and Run the Team step 6" not in flat
 
 
 def test_a_lab3_chat_build_never_gets_lab2s_rebuild_advice(monkeypatch, tmp_path):
-    """A Chat build records its signed-in submitter. Rerunning Run a Build step 1 would
+    """A Chat build records its signed-in submitter. Rerunning Build and Run the Team step 6 would
     start a new game on top of the merged one; its checkout folder is ~/game-lab3."""
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / "game").mkdir()
@@ -541,7 +569,7 @@ def test_a_lab3_chat_build_never_gets_lab2s_rebuild_advice(monkeypatch, tmp_path
                              submitted_by="frontend-dev@workshop.aws",
                              role_prs=_blocked("GATE_RED"))
     flat = " ".join(out.split("what to do now", 1)[1].split())
-    assert "Run a Build step 1" not in flat
+    assert "Build and Run the Team step 6" not in flat
     assert "Next action in Agent Studio" in flat
     assert "checkout ~/game-lab3" in flat and "port 8001" in flat
 
@@ -596,7 +624,7 @@ def test_an_interrupted_run_keeps_its_resubmit_advice_only_without_a_pr(
         out, _rc = _watch_once(tmp, "run_a")
     flat = " ".join(out.split("what to do now", 1)[1].split())
     assert "COORDINATOR_SESSION_INTERRUPTED" in flat
-    assert "Submit it again with Run a Build step 1" in flat
+    assert "Submit it again with Build and Run the Team step 6" in flat
 
     with tempfile.TemporaryDirectory() as tmp:
         _persist_raw(tmp, {"run_id": "run_b", **base,

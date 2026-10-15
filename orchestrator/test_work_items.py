@@ -290,3 +290,43 @@ def test_linked_worktrees_isolate_roles_and_survive_refresh(tmp_path):
         ["git", "-C", str(frontend_dir), "status", "--porcelain"],
         text=True,
     ) == ""
+
+
+def test_a_builders_own_gitignore_keeps_its_build_output_out_of_the_pull_request(tmp_path):
+    """Live run run_035327: Codex's frontend/.gitignore listed dist/ and *.tsbuildinfo,
+    the engine shipped both anyway, and the 231 KB bundle pushed the review past its
+    context limit. A new ignored file is not part of the change, as with `git add -A`;
+    a file the base already tracks stays tracked even when it matches."""
+    item = _item("run_1", "frontend", "c")
+    base = tmp_path / "base"
+    work = tmp_path / "work"
+    (base / "site").mkdir(parents=True)
+    (base / "site" / "logo.min.js").write_text("old\n")
+    (work / "frontend" / "src").mkdir(parents=True)
+    (work / "frontend" / "dist" / "assets").mkdir(parents=True)
+    (work / "site").mkdir()
+    (work / ".gitignore").write_text("*.min.js\n")
+    (work / "frontend" / ".gitignore").write_text("node_modules/\ndist/\n*.tsbuildinfo\n!keep.tsbuildinfo\n")
+    (work / "frontend" / "src" / "App.tsx").write_text("export const App = 1\n")
+    (work / "frontend" / "dist" / "index.html").write_text("<html></html>\n")
+    (work / "frontend" / "dist" / "assets" / "index-abc.js").write_text("x" * 1000)
+    (work / "frontend" / "tsconfig.tsbuildinfo").write_text("{}\n")
+    (work / "frontend" / "keep.tsbuildinfo").write_text("{}\n")
+    (work / "site" / "logo.min.js").write_text("new\n")       # tracked on the base
+    (work / "site" / "extra.min.js").write_text("generated\n")  # new and ignored
+
+    patch = work_items.diff_trees(item, str(base), str(work))
+
+    assert patch.changed_files == [
+        ".gitignore", "frontend/.gitignore", "frontend/keep.tsbuildinfo",
+        "frontend/src/App.tsx", "site/logo.min.js"]
+    assert patch.deleted_files == []
+
+
+def test_without_any_gitignore_every_new_file_is_part_of_the_change(tmp_path):
+    item = _item("run_1", "backend", "d")
+    base, work = tmp_path / "base", tmp_path / "work"
+    base.mkdir()
+    (work / "dist").mkdir(parents=True)
+    (work / "dist" / "out.js").write_text("built\n")
+    assert work_items.diff_trees(item, str(base), str(work)).changed_files == ["dist/out.js"]

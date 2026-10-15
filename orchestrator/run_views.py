@@ -287,7 +287,7 @@ def next_action(status: str, fail_reason: str | None,
                 + (detail or "the GitHub pull-request destination did not resolve.")
                 + " Fix that, then resubmit.")
     if reason.startswith("RUNTIME_NOT_WIRED"):
-        return ("A routed role has no wired runtime ARN. Deploy that role (Lab 1) or "
+        return ("A routed role has no wired runtime ARN. Create that role's Runtime (Lab 1 or Lab 4) or "
                 "wire its ARN, then resubmit; the engine never falls back to a local "
                 "build.")
     if reason.startswith(("UNKNOWN_PRESET", "UNKNOWN_ROLE")):

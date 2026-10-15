@@ -3,7 +3,7 @@
 
     python3 fanout.py                  # 10 agents, the consolidation job below
     python3 fanout.py --agents 20      # twenty microVMs, same command
-    python3 fanout.py --task "..."     # your own job; {repo} is each agent's folder
+    python3 fanout.py --task "..."     # your own job; {repo} is the folder, {n} the agent number
 
 Every agent is a NEW session on the same Claude Code Runtime, so every agent is its
 own microVM: its own memory, processes, and /tmp. They share exactly one thing on
@@ -50,14 +50,23 @@ FLEET = "fleet"
 
 TASK = (
     "You are one of many agents working at the same time; this folder is yours alone: {repo}. "
-    "It holds one small HTTP service. Bring it to our team standard: add a GET /health "
-    "endpoint that returns HTTP 200 with the JSON body "
-    '{{"status": "ok", "service": "<the service name from README.md>"}}, in the language '
-    "and style the service already uses, without new dependencies and without changing "
-    "any other behavior. Then add a short 'Health check' section to README.md with a curl "
-    "example. Work only inside {repo}. When you are done, print exactly one final line: "
+    "It holds one small HTTP service. Bring it to our team standard, which the CLAUDE.md "
+    "in the fleet folder above it describes, in the language and style the service "
+    "already uses, without new dependencies and without changing any other behavior. "
+    "Work only inside {repo}. When you are done, print exactly one final line: "
     "DONE <one sentence on what you changed>."
 )
+
+# The platform team's standard, as a file every agent reads: Claude Code loads CLAUDE.md
+# from its working folder and every parent. Seeded once; your edits are never replaced.
+STANDARD = """# Our service standard
+
+Every service in this fleet must have:
+
+- A `GET /health` endpoint that returns HTTP 200 with the JSON body
+  `{"status": "ok", "service": "<the service name from README.md>"}`.
+- A short "Health check" section in README.md with a curl example.
+"""
 
 # Small services that grew up apart: different languages, styles, ports, and layouts.
 SEEDS = [
@@ -148,6 +157,9 @@ server.listen(process.env.PORT ?? 4000);
 def seed(root: Path, n: int) -> list[Path]:
     """Create N small repositories under root, cycling the styles above."""
     root.mkdir(parents=True, exist_ok=True)
+    standard = root / "CLAUDE.md"
+    if not standard.exists():
+        standard.write_text(STANDARD)
     repos = []
     for i in range(1, n + 1):
         lang, name, entry, code = SEEDS[(i - 1) % len(SEEDS)]
@@ -166,10 +178,20 @@ def seed(root: Path, n: int) -> list[Path]:
 
 
 def runtime_arn(role: str = "claude-code") -> str:
+    """$ARN if set, else a recorded deploy, else the Runtime named after the role."""
+    if os.environ.get("ARN", "").startswith("arn:"):
+        return os.environ["ARN"]
     config = HERE / role / "runtime_config.json"
-    if not config.exists():
-        sys.exit(f"No {role} Runtime yet. Create it first:  ./deploy-prebuilt.sh {role}")
-    return json.loads(config.read_text())["runtime_arn"]
+    if config.exists():
+        return json.loads(config.read_text())["runtime_arn"]
+    import boto3  # noqa: PLC0415
+    name = role.replace("-", "_")
+    pages = boto3.client("bedrock-agentcore-control").get_paginator("list_agent_runtimes")
+    for page in pages.paginate():
+        for runtime in page.get("agentRuntimes", []):
+            if runtime.get("agentRuntimeName") == name:
+                return runtime["agentRuntimeArn"]
+    sys.exit(f"No Runtime named {name} yet. Create it first (Lab 1, Create the Runtime and Open a Session, step 1).")
 
 
 def agent_command(index: int, repo_in_vm: str, task: str) -> str:
@@ -179,7 +201,7 @@ def agent_command(index: int, repo_in_vm: str, task: str) -> str:
     /tmp after this agent writes its own. PEERS counts the Claude Code processes this
     agent can see once its own is running. Both are 1 in an isolated microVM.
     """
-    prompt = task.format(repo=repo_in_vm)
+    prompt = task.format(repo=repo_in_vm, n=index)
     probe = (
         "echo UP $(cut -d. -f1 /proc/uptime); "
         f"touch /tmp/fanout-agent-{index:02d}; echo SIBLINGS $(ls /tmp/fanout-agent-* | wc -l); "
@@ -204,7 +226,10 @@ class Tile:
     started: float = 0.0
     finished: float = 0.0
     check: str = ""
+    health: str = ""  # what /health returned beyond its status, e.g. version=1.0
     error: str = ""
+    errors: list = field(default_factory=list)  # every failure, whole, for the summary
+    retried: bool = False
 
     def elapsed(self, now: float) -> float:
         if not self.started:
@@ -250,6 +275,7 @@ def run_tile(tile: Tile, arn: str, region: str, repo_in_vm: str, task: str, lock
             tile.error = f"exit {code}"
     except Exception as exc:  # noqa: BLE001 (shown on the board, never hidden)
         tile.state, tile.error = "failed", f"{type(exc).__name__}: {exc}"[:120]
+        tile.errors.append(f"session {tile.session}: {type(exc).__name__}: {exc}"[:600])
     finally:
         tile.finished = time.time()
         try:
@@ -258,13 +284,32 @@ def run_tile(tile: Tile, arn: str, region: str, repo_in_vm: str, task: str, lock
             pass
 
 
+def run_tile_with_one_retry(tile: Tile, arn: str, region: str, repo_in_vm: str, task: str,
+                            lock: threading.Lock, run=None) -> None:
+    """A session that failed before its agent reported anything did no work, so it gets
+    one more try in a NEW session (a new microVM). A failure after work began is a
+    result: it stays on the board, never retried."""
+    run = run or run_tile
+    run(tile, arn, region, repo_in_vm, task, lock)
+    if tile.state == "failed" and not tile.up and tile.errors and not tile.retried:
+        with lock:
+            tile.retried, tile.session = True, str(uuid.uuid4())
+            tile.state, tile.error, tile.last = "starting", "", ""
+        run(tile, arn, region, repo_in_vm, task, lock)
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-def check_health(repo: Path, timeout_s: float = 15.0) -> str:
+def _extra(body: dict) -> str:
+    """The fields a service's /health returns beyond `status`: your standard, as served."""
+    return " ".join(f"{k}={v}" for k, v in sorted(body.items()) if k != "status")[:40]
+
+
+def check_health(repo: Path, timeout_s: float = 15.0) -> tuple[str, str]:
     """Start the changed service on the host and call /health. The response decides."""
     import urllib.request
     lang, entry = (repo / ".start").read_text().split()
@@ -278,10 +323,12 @@ def check_health(repo: Path, timeout_s: float = 15.0) -> str:
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as r:
                     body = json.loads(r.read().decode() or "{}")
-                    return "pass" if r.status == 200 and body.get("status") == "ok" else f"fail: {body}"[:60]
+                    if r.status == 200 and isinstance(body, dict) and body.get("status") == "ok":
+                        return "pass", _extra(body)
+                    return f"fail: {body}"[:60], ""
             except Exception:  # noqa: BLE001 (not up yet, or no /health)
                 time.sleep(0.4)
-        return "fail: no /health"
+        return "fail: no /health", ""
     finally:
         try:
             os.killpg(proc.pid, signal.SIGTERM)
@@ -306,17 +353,58 @@ def render(tiles: list[Tile], started: float, color: bool = True) -> str:
         seen = f"{t.siblings or '·'}/{t.peers or '·'}"
         line = (f"  {dot} {t.repo.name:8}  session {t.session[:8]}  up {(t.up + 's') if t.up else '·':>5}  "
                 f"sees {seen:3}  {t.state:8} {t.elapsed(now):5.0f}s  {(t.check or '').ljust(6)}  "
+                f"{(t.health + '  ') if t.health else ''}{'(second session) ' if t.retried else ''}"
                 f"{t.error or t.last}")[:160]
         rows.append(f"\033[{COLORS[t.state]}m{line}\033[0m" if color else line)
     return "\n".join(rows)
 
 
+# The first line of every index page fanout writes; a page without it is someone else's.
+INDEX_MARK = "<!-- written by coding-agents/fanout.py; rerunning the job rewrites it -->\n"
+
+
+def health_fields(tiles: list[Tile]) -> str:
+    """Which fields the passing services' /health served beyond status, and on how many:
+    the standard you wrote, as the fleet actually serves it."""
+    passing = [t for t in tiles if t.check == "pass"]
+    counts: dict[str, int] = {}
+    for t in passing:
+        for key in {pair.split("=", 1)[0] for pair in t.health.split() if "=" in pair}:
+            counts[key] = counts.get(key, 0) + 1
+    return ", ".join(f"{k} on {n}/{len(passing)}" for k, n in sorted(counts.items()))
+
+
+def write_index(root: Path, tiles: list[Tile]) -> Path | None:
+    """An index of every agent's folder with its final line, so a folder of games is an
+    arcade. None when the folder already has an index.html that fanout did not write."""
+    import html
+    cards = []
+    for t in tiles:
+        name = html.escape(t.repo.name)
+        note = html.escape((t.last or t.error or t.state).removeprefix("DONE ").strip())
+        cards.append(f'<a class="card {t.state}" href="{name}/"><b>{name}</b><span>{note}</span></a>')
+    page = ("<!doctype html><meta charset=utf-8><title>Arcade</title><style>"
+            "body{font:16px system-ui;background:#0b1020;color:#e8ecff;margin:2rem}"
+            "main{display:grid;grid-template-columns:repeat(auto-fill,minmax(14rem,1fr));gap:1rem}"
+            ".card{display:flex;flex-direction:column;gap:.4rem;padding:1rem;border-radius:.6rem;"
+            "background:#18214a;color:inherit;text-decoration:none}.card:hover{background:#26337a}"
+            ".failed{opacity:.5}span{font-size:.9rem;color:#b8c2ff}</style>"
+            f"<h1>Arcade: {len(tiles)} microVMs, one twist each</h1><main>{''.join(cards)}</main>\n")
+    target = root / "index.html"
+    if target.exists() and INDEX_MARK not in target.read_text(errors="replace"):
+        return None
+    target.write_text(INDEX_MARK + page)
+    return target
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--agents", type=int, default=10, help="how many sessions (microVMs) to start")
-    ap.add_argument("--task", default=TASK, help="the job; {repo} becomes each agent's folder")
+    ap.add_argument("--task", default=TASK, help="the job; {repo} is each agent's folder, {n} its number")
     ap.add_argument("--no-seed", action="store_true", help="keep the existing repositories")
     ap.add_argument("--no-check", action="store_true", help="skip the host-side /health check")
+    ap.add_argument("--folder", default=FLEET,
+                    help="folder under the mount; a new one gets an empty repo-NN per agent")
     a = ap.parse_args()
     if not 1 <= a.agents <= 50:
         ap.error("--agents must be between 1 and 50")
@@ -324,15 +412,20 @@ def main() -> int:
         sys.exit(f"{MOUNT} is not mounted on this host")
     arn = runtime_arn()
     region = arn.split(":")[3]
-    root = MOUNT / FLEET
+    root = MOUNT / a.folder
+    if a.folder != FLEET:
+        # Your own job in its own folder: one empty folder per agent, nothing seeded.
+        a.no_seed = a.no_check = True
+        for i in range(1, a.agents + 1):
+            (root / f"repo-{i:02d}").mkdir(parents=True, exist_ok=True)
     repos = sorted(root.glob("repo-*"))[: a.agents] if a.no_seed else seed(root, a.agents)
     if len(repos) < a.agents:
         sys.exit(f"Only {len(repos)} repositories under {root}; drop --no-seed to create them")
     tiles = [Tile(i + 1, repo) for i, repo in enumerate(repos)]
     lock = threading.Lock()
     started = time.time()
-    threads = [threading.Thread(target=run_tile, daemon=True,
-                                args=(t, arn, region, f"/mnt/s3files/{FLEET}/{t.repo.name}", a.task, lock))
+    threads = [threading.Thread(target=run_tile_with_one_retry, daemon=True,
+                                args=(t, arn, region, f"/mnt/s3files/{a.folder}/{t.repo.name}", a.task, lock))
                for t in tiles]
     for th in threads:
         th.start()
@@ -343,7 +436,7 @@ def main() -> int:
         if not alive and not a.no_check:
             for t in tiles:
                 if t.state == "done" and not t.check:
-                    t.check = check_health(t.repo)
+                    t.check, t.health = check_health(t.repo)
         frame = render(tiles, started, color=tty)
         if tty:
             sys.stdout.write(("\033[F" * lines) + "\033[J" + frame + "\n")
@@ -363,13 +456,26 @@ def main() -> int:
     print(f"  {sum(bool(t.up) for t in tiles)} sessions, each its own microVM. What each agent could see "
           f"of the others: agent files in /tmp {', '.join(counts) or '?'}; Claude Code processes "
           f"{', '.join(peers) or '?'} (1 means only its own).")
+    for t in tiles:
+        for err in t.errors:
+            print(f"  {t.repo.name}: {err}")
+    fields = health_fields(tiles)
+    if fields:
+        print(f"  /health beyond status: {fields}")
     print(f"  The changes are on the shared mount: {root}/repo-*")
+    if a.folder != FLEET:
+        if write_index(root, tiles):
+            print(f"  One page for all of them: {root}/index.html")
+        else:
+            print(f"  Left {root}/index.html alone: fanout did not write it.")
     # A record of this run for progress.py; it describes the run and judges nothing.
     summary = {"at": int(time.time()), "agents": len(tiles),
                "finished": sum(t.state == "done" for t in tiles),
                "passed_health": sum(t.check == "pass" for t in tiles),
                "microvms": sum(bool(t.up) for t in tiles),
-               "sibling_counts": counts, "peer_counts": peers, "wall_s": round(wall), "serial_s": round(serial)}
+               "sibling_counts": counts, "peer_counts": peers, "wall_s": round(wall), "serial_s": round(serial),
+               "retried": sum(t.retried for t in tiles),
+               "errors": {t.repo.name: t.errors for t in tiles if t.errors}}
     try:
         (root / "fanout-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     except OSError:

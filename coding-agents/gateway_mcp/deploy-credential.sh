@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 
 SECRET_NAME="agentcore/github-mcp/github-app"
+WEBHOOK_SECRET_NAME="agentcore/github-mcp/webhook"
 
 echo "==> Deploying GitHub App Secret to Secrets Manager: ${SECRET_NAME}"
 
@@ -157,6 +158,9 @@ SECRET_VALUE=$(jq -n \
   '{app_id: $app_id, private_key: $private_key, installation_id: $installation_id}
    + (if $webhook_secret == "" then {} else {webhook_secret: $webhook_secret} end)')
 
+# Secret values reach the CLI on stdin (file:///dev/stdin), never in argv, where any
+# local process listing could read them while the call runs.
+
 # Check if secret already exists
 EXISTING=$(aws secretsmanager describe-secret \
   --secret-id "$SECRET_NAME" \
@@ -166,7 +170,7 @@ if [[ -n "$EXISTING" ]]; then
   echo "Secret '${SECRET_NAME}' already exists. Updating..."
   aws secretsmanager put-secret-value \
     --secret-id "$SECRET_NAME" \
-    --secret-string "$SECRET_VALUE" \
+    --secret-string file:///dev/stdin <<<"$SECRET_VALUE" \
     --region "$AWS_REGION"
   SECRET_ARN=$(echo "$EXISTING" | jq -r '.ARN')
 else
@@ -174,7 +178,7 @@ else
   CREATE_RESPONSE=$(aws secretsmanager create-secret \
     --name "$SECRET_NAME" \
     --description "GitHub App credentials for AgentCore GitHub MCP server" \
-    --secret-string "$SECRET_VALUE" \
+    --secret-string file:///dev/stdin <<<"$SECRET_VALUE" \
     --region "$AWS_REGION" \
     --output json)
   SECRET_ARN=$(echo "$CREATE_RESPONSE" | jq -r '.ARN')
@@ -182,6 +186,21 @@ fi
 
 state_set "github_app_secret_arn" "$SECRET_ARN"
 echo "Secret ARN: ${SECRET_ARN}"
+
+# The review endpoint needs only the webhook secret, never the App's private key, so it
+# gets a secret of its own and its role may read nothing else.
+if [[ -n "${GITHUB_APP_WEBHOOK_SECRET:-}" ]]; then
+  WEBHOOK_VALUE=$(jq -n --arg webhook_secret "$GITHUB_APP_WEBHOOK_SECRET" '{webhook_secret: $webhook_secret}')
+  if aws secretsmanager describe-secret --secret-id "$WEBHOOK_SECRET_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+    aws secretsmanager put-secret-value --secret-id "$WEBHOOK_SECRET_NAME" \
+      --secret-string file:///dev/stdin --region "$AWS_REGION" >/dev/null <<<"$WEBHOOK_VALUE"
+  else
+    aws secretsmanager create-secret --name "$WEBHOOK_SECRET_NAME" \
+      --description "The secret GitHub signs this App's webhook deliveries with" \
+      --secret-string file:///dev/stdin --region "$AWS_REGION" >/dev/null <<<"$WEBHOOK_VALUE"
+  fi
+  echo "Webhook secret: ${WEBHOOK_SECRET_NAME} (the review endpoint reads only this one)"
+fi
 
 echo ""
 echo "==> GitHub App secret deployment complete."

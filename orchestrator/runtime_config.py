@@ -10,6 +10,10 @@ code. This module is that surface, mirroring ``github.py``'s credential ladder:
   2. the Settings pane: written to a gitignored ``.runs/runtime.local.json``
      (0600), the same place GitHub creds land. Attendees paste the ARN the
      ``agentcore deploy`` output printed, or set it from the terminal.
+  3. a harness ``deploy.py``'s own ``coding-agents/<role>/runtime_config.json``.
+  4. the Runtime's NAME: one created in the AgentCore console has no local file, so
+     ``claude-code`` is the Runtime named ``claude_code``, exactly as the console's
+     own Runtime list, ``progress.py`` and the coordinator deploy read it.
 
 FLEET, not singletons: a role may have MORE THAN ONE deployed runtime ("3 types"
 does not mean exactly 3 instances; the fleet may be 2 Claude Code + 5 opencode + 1
@@ -31,6 +35,7 @@ import json
 import os
 import re
 import threading
+import time
 from typing import Any
 
 import roles as _roles
@@ -172,6 +177,88 @@ def _discover_deployed(role: str) -> list[str]:
     return [arn] if arn and _ARN_RE.match(arn) else []
 
 
+# A Runtime created in the AgentCore console (Lab 1 and Lab 4 of the workshop) has
+# no runtime_config.json anywhere: its name is the whole contract. Listing Runtimes is
+# an AWS call and the console polls its wiring view, so one listing per region serves
+# every role for a short while. Discovery is on by default and switched off for the
+# offline suite (the root conftest), which must never list a developer's real account.
+_NAME_TTL_S = 60.0
+_NAME_LOCK = threading.Lock()
+_NAME_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
+# A Runtime that cannot take a session yet (or any more) is not a dispatch target.
+_SERVING = ("READY", "UPDATING")
+
+
+def _named_discovery_enabled() -> bool:
+    return os.environ.get("WORKSHOP_RUNTIME_NAME_DISCOVERY", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _region() -> str:
+    region = (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "").strip()
+    if region:
+        return region
+    try:
+        import boto3  # noqa: PLC0415
+        return boto3.session.Session().region_name or ""
+    except Exception:  # noqa: BLE001  (no SDK or no config: nothing to discover)
+        return ""
+
+
+def _list_runtimes(region: str) -> list[dict[str, Any]]:
+    """Every Runtime summary in the region (``ListAgentRuntimes``). Raises on failure."""
+    import boto3  # noqa: PLC0415
+    client = boto3.client("bedrock-agentcore-control", region_name=region)
+    out: list[dict[str, Any]] = []
+    for page in client.get_paginator("list_agent_runtimes").paginate():
+        out.extend(page.get("agentRuntimes", []))
+    return out
+
+
+def _runtimes_by_name(region: str) -> dict[str, str]:
+    """name -> ARN for every serving Runtime in the region, cached for a minute.
+
+    A failed listing (no credentials, no permission, throttling) is cached as empty
+    for the same minute: the role then reads as unwired, the honest answer, and a
+    polling page does not turn one AccessDenied into a request storm."""
+    now = time.monotonic()
+    with _NAME_LOCK:
+        hit = _NAME_CACHE.get(region)
+        if hit and now - hit[0] < _NAME_TTL_S:
+            return hit[1]
+    try:
+        names = {r["agentRuntimeName"]: r["agentRuntimeArn"] for r in _list_runtimes(region)
+                 if r.get("agentRuntimeName") and r.get("agentRuntimeArn")
+                 and str(r.get("status", "READY")).upper() in _SERVING}
+    except Exception:  # noqa: BLE001
+        names = {}
+    with _NAME_LOCK:
+        _NAME_CACHE[region] = (now, names)
+    return names
+
+
+def runtime_name(role: str) -> str:
+    """The Runtime name a role is known by: ``claude-code`` -> ``claude_code``."""
+    return role.replace("-", "_")
+
+
+def named_runtime(role: str) -> str:
+    """The ARN of the serving Runtime named after ``role`` in this region, or ''."""
+    if not _named_discovery_enabled() or role not in _harness_dirs():
+        return ""
+    region = _region()
+    if not region:
+        return ""
+    arn = _runtimes_by_name(region).get(runtime_name(role), "")
+    return arn if _ARN_RE.match(arn) else ""
+
+
+def forget_named_runtimes() -> None:
+    """Drop the cached listing, so the next read sees a Runtime created a moment ago."""
+    with _NAME_LOCK:
+        _NAME_CACHE.clear()
+
+
 def _load_descriptions() -> dict[str, str]:
     """Free-text descriptions of what each agent does, keyed by INSTANCE ARN (so a
     fleet can describe each instance independently). For back-compat a key that is
@@ -267,9 +354,12 @@ def instances(role: str) -> list[tuple[str, str]]:
          terminal writes (an attendee pasted the ARN, or grew a fleet).
       3. ``deployed``    : auto-discovered from the harness's own
          ``coding-agents/<role>/runtime_config.json`` that ``deploy.py`` wrote.
-         This is what surfaces a role the EVENT STACK pre-provisioned (today
-         Codex and the Kiro validator, from the prebuilt images)
-         as already wired without the attendee pasting anything.
+         This is what surfaces a Runtime ``deploy.py`` created (a stack's
+         ``PrebuildAgents``, or ``deploy-prebuilt.sh`` in your own account) as
+         already wired without the attendee pasting anything.
+      4. ``named``       : the serving Runtime NAMED after the role in this region
+         (``claude-code`` -> ``claude_code``), which is how a Runtime created in the
+         AgentCore console is found: it has no local file at all.
     Returns [] for a role with nothing wired anywhere."""
     env = os.environ.get(_env_key(role))
     if env:
@@ -277,7 +367,11 @@ def instances(role: str) -> list[tuple[str, str]]:
     saved = _load_file().get(role, [])
     if saved:
         return [(arn, "settings") for arn in saved]
-    return [(arn, "deployed") for arn in _discover_deployed(role)]
+    deployed = _discover_deployed(role)
+    if deployed:
+        return [(arn, "deployed") for arn in deployed]
+    named = named_runtime(role)
+    return [(named, "named")] if named else []
 
 
 def resolve(role: str) -> tuple[str, str] | None:
@@ -372,6 +466,11 @@ def remove_runtime(role: str, arn: str) -> dict[str, Any]:
                          f"/runtime_config.json declares for {role} (a pre-provisioned "
                          f"deployment), so it cannot be unwired from here; tear the "
                          f"runtime down with that role's cleanup.py instead"}
+    if src == "named":
+        return {"error": f"{arn} is the Runtime named {runtime_name(role)} in your account, "
+                         f"found by its name, so it cannot be unwired from here; delete or "
+                         f"rename it in the AgentCore console, or wire another ARN in "
+                         f"Settings, which takes precedence"}
     runtimes = _load_file()
     fleet = [a for a in runtimes.get(role, []) if a != arn]
     if fleet:

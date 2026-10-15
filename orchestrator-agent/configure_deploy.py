@@ -83,6 +83,21 @@ def _stack_outputs(stack_name: str, region: str) -> dict[str, str]:
     return {}
 
 
+def named_runtime_arn(role: str, region: str | None = None) -> str:
+    """The ARN of the Runtime named after a role (``claude-code`` -> ``claude_code``), or "".
+
+    A Runtime built in the AgentCore console has no runtime_config.json; its name is the
+    whole contract, exactly as in the console's own Runtime list."""
+    import boto3  # noqa: PLC0415
+    name = role.replace("-", "_")
+    client = boto3.client("bedrock-agentcore-control", region_name=_region(region))
+    for page in client.get_paginator("list_agent_runtimes").paginate():
+        for runtime in page.get("agentRuntimes", []):
+            if runtime.get("agentRuntimeName") == name:
+                return runtime["agentRuntimeArn"]
+    return ""
+
+
 def _runtime_arns(source_root: Path) -> dict[str, str]:
     arns: dict[str, str] = {}
     for role in ROLES():
@@ -90,7 +105,10 @@ def _runtime_arns(source_root: Path) -> dict[str, str]:
         try:
             arn = json.loads(path.read_text(encoding="utf-8"))["runtime_arn"]
         except (OSError, KeyError, ValueError) as exc:
-            raise SystemExit(f"runtime ARN missing for {role}: {path} ({exc})") from exc
+            arn = named_runtime_arn(role) if not path.exists() else ""
+            if not arn:
+                raise SystemExit(f"runtime ARN missing for {role}: no {path} and no Runtime "
+                                 f"named {role.replace('-', '_')} ({exc})") from exc
         if not isinstance(arn, str) or not arn.startswith("arn:aws:bedrock-agentcore:"):
             raise SystemExit(f"invalid runtime ARN for {role}: {arn!r}")
         arns[role] = arn

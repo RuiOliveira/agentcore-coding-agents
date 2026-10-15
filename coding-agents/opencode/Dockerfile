@@ -1,4 +1,5 @@
-ARG WORKSHOP_RUNTIME_BASE_IMAGE
+# Built with named contexts: docker buildx bake <role>, from the repository root (docker-bake.hcl).
+ARG WORKSHOP_RUNTIME_BASE_IMAGE=public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:06da5a3362eda00c5114227ac81abe56dd9b943395553b7c64a310457f4d9e2b
 FROM ${WORKSHOP_RUNTIME_BASE_IMAGE}
 
 RUN dnf install -y --allowerasing \
@@ -37,7 +38,7 @@ RUN useradd -m -d /home/agent -u 1000 agent
 
 # boto3 + awscurl support AWS and MCP calls. opencode authenticates to Bedrock
 # through the runtime role's normal AWS SDK credential chain.
-COPY _toolchain/ /opt/workshop-cli/
+COPY --from=toolchain cli-versions.json cli_versions.py /opt/workshop-cli/
 RUN python3 -m pip install --quiet awscurl $(python3 /opt/workshop-cli/cli_versions.py sdk-requirements)
 
 # opencode config: Amazon Bedrock provider, Claude Sonnet 4.5. A per-run project
@@ -45,7 +46,7 @@ RUN python3 -m pip install --quiet awscurl $(python3 /opt/workshop-cli/cli_versi
 RUN mkdir -p /home/agent/.config/opencode && chown -R agent:agent /home/agent/.config
 COPY --chown=agent:agent opencode.json /home/agent/.config/opencode/opencode.json
 
-COPY --chown=agent:agent healthcheck.py /app/healthcheck.py
+COPY --chown=agent:agent --from=toolchain healthcheck.py /app/healthcheck.py
 COPY --chown=agent:agent configure_opencode.py /app/configure_opencode.py
 COPY run.sh /app/run.sh
 COPY entrypoint.sh /app/entrypoint.sh
@@ -68,4 +69,5 @@ USER agent
 
 # entrypoint.sh starts the OTel collector at boot, then exec's the CMD.
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["python3", "/app/healthcheck.py"]
+# /ping: HealthyBusy while the agent CLI runs, so a detached session keeps working.
+CMD ["python3", "/app/healthcheck.py", "--agent", "opencode", "--busy", "opencode"]

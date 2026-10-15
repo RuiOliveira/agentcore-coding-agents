@@ -201,3 +201,22 @@ def test_the_backend_skill_keeps_install_off_the_start_path() -> None:
     text = open(path, encoding="utf-8").read().lower()
     assert "foreground" in text, "a backgrounding start reads as a dead service"
     assert "setup, not startup" in text or "install is setup" in text
+
+
+def test_the_check_inherits_no_credentials(tmp_path, monkeypatch) -> None:
+    """The check is model-written code; the process running it may hold credentials that
+    can merge a pull request. None of them reach the check's environment."""
+    import reviewer
+
+    for name, value in (("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE"), ("AWS_SECRET_ACCESS_KEY", "x"),
+                        ("AWS_SESSION_TOKEN", "x"), ("AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://x"),
+                        ("GITHUB_TOKEN", "ghs_x"), ("GITHUB_APP_SECRET_ARN", "arn:x"),
+                        ("ORCHESTRATOR_MODEL_ID", "m")):
+        monkeypatch.setenv(name, value)
+    run = _authored_check(str(tmp_path), "#!/bin/sh\nenv\n")
+    result = reviewer.run_gate(run._acceptance_test_file, run.workdir, run.task)
+    out = str(result)
+    for leaked in ("AKIAEXAMPLE", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+                   "AWS_CONTAINER_CREDENTIALS", "ghs_x", "GITHUB_APP_SECRET_ARN", "ORCHESTRATOR_"):
+        assert leaked not in out, leaked
+    assert "PATH=" in out and "WORKSHOP_WORK_DIR=" in out

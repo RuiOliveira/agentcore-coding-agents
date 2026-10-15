@@ -468,9 +468,9 @@ _WHY = {
 
 _POLICY_WHY = {
     "Logs": "write its own CloudWatch logs",
-    "Telemetry": "export usage telemetry (Lab 3) to CloudWatch and X-Ray",
-    "UsageLogs": "write usage records to CloudWatch Logs (Lab 3)",
-    "InsightsMetrics": "send usage metrics to CloudWatch Coding Agent Insights (Lab 3)",
+    "Telemetry": "export usage telemetry to CloudWatch and X-Ray",
+    "UsageLogs": "write usage records to CloudWatch Logs",
+    "InsightsMetrics": "send usage metrics to CloudWatch Coding Agent Insights",
     "BedrockInvoke": "call Amazon Bedrock models",
     "BedrockOpenAIInference": "call the OpenAI models on Amazon Bedrock",
     "BedrockRuntimeProjectInvoke": "use the default Bedrock project the OpenAI-compatible API needs",

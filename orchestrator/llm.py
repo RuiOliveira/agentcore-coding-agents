@@ -121,11 +121,11 @@ def invoke(model: str, prompt: str, system: str | None = None,
         return _invoke_openai(model_id, prompt, system, max_tokens)
     if tool is not None:
         return _invoke_claude_tool(model_id, prompt, tool, system, max_tokens, effort)
-    return _invoke_claude(model_id, prompt, system, max_tokens)
+    return _invoke_claude(model_id, prompt, system, max_tokens, effort)
 
 
 def _invoke_claude(model_id: str, prompt: str, system: str | None,
-                   max_tokens: int) -> dict[str, Any]:
+                   max_tokens: int, effort: str = "") -> dict[str, Any]:
     try:
         import boto3  # noqa: PLC0415
         rt = boto3.client("bedrock-runtime", region_name=claude_region() or None)
@@ -136,7 +136,17 @@ def _invoke_claude(model_id: str, prompt: str, system: str | None,
         }
         if system:
             kwargs["system"] = [{"text": system}]
-        resp = rt.converse(**kwargs)
+        # Same contract as the tool path: a model that rejects effort is retried once
+        # without it, so an older model id still answers.
+        if effort:
+            kwargs["additionalModelRequestFields"] = {"output_config": {"effort": effort}}
+        try:
+            resp = rt.converse(**kwargs)
+        except Exception as exc:
+            if not effort or "ValidationException" not in type(exc).__name__ + str(exc):
+                raise
+            kwargs.pop("additionalModelRequestFields", None)
+            resp = rt.converse(**kwargs)
     except Exception as exc:
         raise LLMUnavailable(f"converse({model_id}) failed: {exc}") from exc
     text = "".join(b.get("text", "") for b in resp["output"]["message"]["content"])

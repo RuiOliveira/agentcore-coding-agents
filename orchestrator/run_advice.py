@@ -70,6 +70,18 @@ def is_chat_build(rec: dict) -> bool:
     return bool(str(rec.get("submitted_by") or "").strip())
 
 
+def is_team_build(rec: dict) -> bool:
+    """Part 4's two-builder request; its page checks the game out to ``~/team-game``."""
+    return str(rec.get("preset") or "") == "team-game"
+
+
+def natural_folder(rec: dict) -> str:
+    """The folder the page names for this run's checkout, without ``~/``."""
+    if is_team_build(rec):
+        return "team-game"
+    return "game-lab3" if is_chat_build(rec) else "game"
+
+
 def red_after_repair(rec: dict) -> bool:
     """True only when every blocked pull request stayed red after its one repair."""
     if not str(rec.get("fail_reason") or "").startswith("ROLE_PR_BLOCKED"):
@@ -91,21 +103,23 @@ def holds_app(directory: str) -> tuple[bool | None, int]:
 def checkout_target(rec: dict, home: str) -> tuple[str, bool]:
     """(``~/<dir>``, already) for this run's checkout.
 
-    The pages name the folder by lab: ``~/game`` for the Lab 2 build and
-    ``~/game-lab3`` for the Lab 3 fix. ``github.py checkout`` REPLACES its
-    destination, so a folder that already holds an app is never suggested: the
-    caller says it is already checked out and offers a separate, unused folder.
+    The pages name the folder by lab: ``~/game`` for the Lab 2 build,
+    ``~/game-lab3`` for the Lab 3 fix, and ``~/team-game`` for Lab 4's team build.
+    ``github.py checkout`` REPLACES its destination, so a folder that already holds
+    an app is never suggested: the caller says it is already checked out and offers
+    a separate, unused folder.
     A folder holding only the repository's starter files is safe to replace.
     """
-    natural = "game-lab3" if is_chat_build(rec) else "game"
+    natural = natural_folder(rec)
     has, _ = holds_app(os.path.join(home, natural))
     if not has:
         return f"~/{natural}", False
     suffix = (str(rec.get("run_id") or "").rsplit("_", 1)[-1] or "new")[:6]
-    for name in [f"game-{suffix}"] + [f"game-{suffix}-{n}" for n in range(2, 100)]:
+    stem = "team-game" if is_team_build(rec) else "game"
+    for name in [f"{stem}-{suffix}"] + [f"{stem}-{suffix}-{n}" for n in range(2, 100)]:
         if not os.path.exists(os.path.join(home, name)):
             return f"~/{name}", True
-    return f"~/game-{suffix}-new", True
+    return f"~/{stem}-{suffix}-new", True
 
 
 def port_for(target: str) -> int | None:

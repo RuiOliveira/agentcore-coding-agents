@@ -412,30 +412,6 @@ def test_kiro_main_binary_alone_is_not_a_complete_installation(tmp_path, tools):
         cli.install_cli("kiro", home=home)
 
 
-def test_build_context_excludes_untracked_private_files_and_keeps_exact_pins(tmp_path):
-    repo = tmp_path / "repo"
-    role = repo / "coding-agents/claude-code"
-    role.mkdir(parents=True)
-    skill = repo / "harness-skills/skills/backend-engineering/SKILL.md"
-    skill.parent.mkdir(parents=True)
-    skill.write_text("principles\n")
-    (role / "Dockerfile").write_text("COPY _toolchain/ /opt/workshop-cli/\n")
-    (role / "run.sh").write_text("exit 0\n")
-    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    (repo / "root-secret.private.json").write_text("must stay out")
-    (role / "agent.config").write_text("must stay out")
-    (role / "nested").mkdir()
-    (role / "nested/secret.private.json").write_text("must stay out")
-    stage = tmp_path / "stage"
-    result = cli.stage_context(role, stage)
-    assert sorted(str(p.relative_to(stage)) for p in stage.rglob("*") if p.is_file()) == [
-        "Dockerfile", "_toolchain/cli-versions.json", "_toolchain/cli_versions.py",
-        "run.sh", "skills/backend-engineering/SKILL.md"]
-    assert (stage / "_toolchain/cli-versions.json").read_bytes() == cli.MANIFEST_PATH.read_bytes()
-    assert result["manifest_sha256"] == cli.manifest_sha256()
-
-
 def test_host_command_uses_selected_home_and_sdk_python(tmp_path, monkeypatch, tools, capsys):
     home = tmp_path / "attendee"
     data = cli.load_manifest()
@@ -466,37 +442,27 @@ else:
 
 
 @pytest.mark.parametrize("builder,fail", [("docker", False), ("finch", False), ("finch", True)])
-def test_real_build_helper_stages_safe_context_and_propagates_failure(
+def test_real_build_helper_passes_the_named_contexts_and_propagates_failure(
         tmp_path, monkeypatch, tools, builder, fail):
-    repo = tmp_path / "repo"
-    role = repo / "coding-agents/codex"
-    role.mkdir(parents=True)
-    (role / "Dockerfile").write_text("ARG WORKSHOP_RUNTIME_BASE_IMAGE\nFROM ${WORKSHOP_RUNTIME_BASE_IMAGE}\n")
-    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    (role / "agent.config").write_text("excluded")
+    """The shared helper builds exactly what docker-bake.hcl declares: the role folder,
+    a "toolchain" context holding the pinned manifest, a "skills" context, and the
+    manifest's base image. A failing builder fails the helper."""
+    role = ROOT / "coding-agents/codex"
     log = tmp_path / "build.json"
     monkeypatch.setenv("BUILDER_TEST_LOG", str(log))
     monkeypatch.setenv("BUILDER_TEST_KIND", builder)
     monkeypatch.setenv("BUILDER_TEST_FAIL", "1" if fail else "0")
     executable(tools / "aws", "#!/bin/sh\nprintf 'fixture-login\\n'\n")
-    # Use the session interpreter; never accidentally import host Python deps.
     (tools / "python3").symlink_to(sys.executable)
     builder_body = f"""#!{sys.executable}
 import json, os, pathlib, sys
 args = sys.argv[1:]
 if args == ["buildx", "version"]:
     raise SystemExit(0 if os.environ["BUILDER_TEST_KIND"] == "docker" else 1)
-if args[0] == "login":
-    sys.stdin.read()
+if args[0] in ("login", "push"):
+    sys.stdin.read() if args[0] == "login" else None
     raise SystemExit(0)
-if args[0] == "push":
-    raise SystemExit(0)
-context = pathlib.Path(args[-2] if args[-1] == "--push" else args[-1])
-record = {{"args": args, "context": str(context),
-          "manifest": json.loads((context / "_toolchain/cli-versions.json").read_text()),
-          "files": sorted(str(p.relative_to(context)) for p in context.rglob("*") if p.is_file())}}
-pathlib.Path(os.environ["BUILDER_TEST_LOG"]).write_text(json.dumps(record))
+pathlib.Path(os.environ["BUILDER_TEST_LOG"]).write_text(json.dumps({{"args": args}}))
 raise SystemExit(23 if os.environ["BUILDER_TEST_FAIL"] == "1" else 0)
 """
     executable(tools / "docker", builder_body)
@@ -507,8 +473,11 @@ raise SystemExit(23 if os.environ["BUILDER_TEST_FAIL"] == "1" else 0)
         ["bash", "-c", command, "fixture", str(ROOT / "coding-agents/_build_push.sh"), str(role)],
         capture_output=True, text=True, timeout=20)
     assert result.returncode == (23 if fail else 0), result.stderr
-    record = json.loads(log.read_text())
-    assert record["manifest"] == cli.load_manifest()
-    assert "WORKSHOP_RUNTIME_BASE_IMAGE=" + cli.load_manifest()["runtime"]["base_image"] in record["args"]
-    assert record["files"] == ["Dockerfile", "_toolchain/cli-versions.json", "_toolchain/cli_versions.py"]
-    assert not Path(record["context"]).exists()
+    args = json.loads(log.read_text())["args"]
+    contexts = {args[i + 1].split("=", 1)[0]: Path(args[i + 1].split("=", 1)[1]).resolve()
+                for i, a in enumerate(args) if a == "--build-context"}
+    assert contexts == {"toolchain": (ROOT / "coding-agents").resolve(),
+                        "skills": (ROOT / "harness-skills/skills").resolve()}
+    assert (contexts["toolchain"] / "cli-versions.json").read_bytes() == cli.MANIFEST_PATH.read_bytes()
+    assert "WORKSHOP_RUNTIME_BASE_IMAGE=" + cli.load_manifest()["runtime"]["base_image"] in args
+    assert Path(args[-2] if args[-1] == "--push" else args[-1]).resolve() == role.resolve()

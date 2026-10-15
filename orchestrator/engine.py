@@ -694,6 +694,18 @@ class Run:
     # from reaching their gates. Keep its reason until those PRs settle.
     _initial_execution_failure: str | None = field(default=None, repr=False)
     _refresh_context: str = ""
+    # A checker-only round: author checks for exactly these work ids, run no builder.
+    _check_subjects: set[str] | None = field(default=None, repr=False)
+    # Under auto merge, a pull request whose dependency merges first has its check
+    # written AFTER that merge, against the branch it merges into, instead of twice.
+    _deferred_checks: set[str] = field(default_factory=set, repr=False)
+    # Pull requests already published in the current execution round.
+    _published_round: set[str] = field(default_factory=set, repr=False)
+    # A green, approved pull request merged while a slower builder still worked
+    # (work_id -> its role_prs row), and a result that must wait for finalization
+    # (work_id -> (gate, approved, stage)) because its repair cannot run mid-graph.
+    _early_rows: dict[str, dict] = field(default_factory=dict, repr=False)
+    _early_gates: dict[str, tuple] = field(default_factory=dict, repr=False)
     # work_id -> the authored check path for THAT pull request. One check per pull
     # request, so this replaces the single _acceptance_test_file on the verdict path
     # (which is kept for the read-only review route and the compose commit).
@@ -1927,6 +1939,13 @@ class Engine:
                 # become WORK_PATCH_MISSING attributed to the checker. Other
                 # builders' completed candidates remain eligible.
                 continue
+            if progress is not None and progress.state in ("working", "pending"):
+                # The checker can start before a builder whose check waits for its
+                # dependency; that builder's PR is published when its turn ends.
+                continue
+            if item.work_id in run._published_round:
+                continue
+            run._published_round.add(item.work_id)
             if self.executor.name == "fixture":
                 item.state = "in_review"
                 item.stale = False
@@ -2451,10 +2470,24 @@ class Engine:
             # request never blocks a green sibling from merging.
             self._publish_active_work_items(run)
             install_harness(role.agent)
-            subjects = [
-                item for item in self._builder_items(run, pending_only=True)
-                if item.agent in active_builders
-            ]
+            if run._check_subjects is not None:
+                subjects = [
+                    item for item in self._builder_items(run, pending_only=True)
+                    if item.work_id in run._check_subjects
+                ]
+            else:
+                subjects = [
+                    item for item in self._builder_items(run, pending_only=True)
+                    if item.agent in active_builders
+                ]
+                waiting = [item for item in subjects
+                           if self._check_waits_for_dependency(run, item)]
+                for item in waiting:
+                    run._deferred_checks.add(item.work_id)
+                    run.log(f"validator: {item.work_id}'s check is written after "
+                            f"{', '.join(item.depends_on)} merges, once, against the "
+                            "branch it merges into")
+                subjects = [item for item in subjects if item not in waiting]
             # A repair selects its owner, not every still-open PR. Preserve the
             # other PRs' check paths, including evidence awaiting its first gate,
             # and never redispatch a sibling's failed check-authoring turn.
@@ -2674,6 +2707,17 @@ class Engine:
             if (roles.get(agent_id).kind == roles.CHECKER
                 or agent_id in active_builders)
         ]
+        run._published_round = set()
+        # The checker waits only for the builders whose checks it writes now. A builder
+        # whose check waits for its dependency keeps building in parallel.
+        checker_waits_for = None
+        if run._check_subjects is None:
+            deferred_agents = {
+                item.agent for item in self._builder_items(run, pending_only=True)
+                if item.agent in active_builders
+                and self._check_waits_for_dependency(run, item)}
+            if deferred_agents and deferred_agents != set(active_builders):
+                checker_waits_for = set(active_builders) - deferred_agents
         # Builders start as one entry batch. The checker is selected for this round,
         # but does not become "working" until its graph node actually starts after
         # every selected builder finishes. Builders not selected for repair keep
@@ -2699,8 +2743,14 @@ class Engine:
         try:
             graph, _nodes = role_graph.build_graph(
                 execution_agents, lambda a: _make_dispatch(run.progress[a], a),
-                execution_timeout=max(1.0, deadline - time.monotonic()))
+                execution_timeout=max(1.0, deadline - time.monotonic()),
+                checker_waits_for=checker_waits_for,
+                after_partial=(lambda: self._finalize_ready_early(run))
+                if checker_waits_for is not None else None)
             role_graph.run_graph(graph)
+            # Builders that finished after the checker started publish now.
+            if checker_waits_for is not None:
+                self._publish_active_work_items(run)
         except Exception as exc:                # noqa: BLE001
             # A graph that could not be built or driven is a PHASE failure, reported as
             # such. It is never a pass: any role left "working" is caught by the
@@ -2854,7 +2904,8 @@ class Engine:
             item for item in self._builder_items(run)
             if run.progress[item.agent].state == "done"
             and item._patch is not None and item.pr
-            and run._item_checks.get(item.work_id)
+            and (run._item_checks.get(item.work_id)
+                 or item.work_id in run._deferred_checks)
         ]
 
     def _record_gate(self, run: Run, gate: dict, stage: str,
@@ -3118,9 +3169,15 @@ class Engine:
         for item in pending:
             previous_base_digest = item.base_digest or _work_items.tree_digest(
                 run.item_base_dir(item.agent), exclude=_work_patch_excluded)
+            # A clean rebase onto a merged dependency is republished without an owner
+            # turn: its check, written on the new branch, judges the integration, and a
+            # red result gets the ordinary bounded repair with the fail lines. On
+            # October 13 the extra owner turn produced a byte-identical patch and cost
+            # 77 s plus a second check. WORKSHOP_SEMANTIC_REFRESH=1 restores it.
             dependency_advanced = (
                 merged_item.work_id in item.depends_on
                 and previous_base_digest != latest_digest
+                and os.environ.get("WORKSHOP_SEMANTIC_REFRESH", "") == "1"
             )
             seed = os.path.join(run.workdir, f"refresh-{item.work_id}")
             conflicts = _work_items.prepare_refresh_checkout(
@@ -3339,7 +3396,15 @@ class Engine:
             "state": "checking",
         } for item in items]
 
+        last_merged: _work_items.WorkItem | None = None
         for item, row in zip(items, run.role_prs):
+            early_row = run._early_rows.get(item.work_id)
+            if early_row:
+                # Already gated, reviewed and merged while a slower builder worked.
+                row.update(early_row)
+                if item.merge_state == "merged":
+                    last_merged = item
+                continue
             if initial_failure and item.work_id not in checkable:
                 row["state"], row["error"] = "blocked", initial_failure
                 item.merge_state = "blocked"
@@ -3350,20 +3415,43 @@ class Engine:
                     "produce an executable for this pull request, so it has no verdict. "
                     "Read the run's next action before merging or resubmitting."))
                 continue
-            stage = f"{item.work_id} round {item.attempt}"
-            run.log(f"gate: running {item.work_id}'s authored check "
-                    f"on {run.final_base_branch}")
-            gate = self._gate_one_pull_request(run, item, stage)
-            approved = gate.get("passed") and self._assess_pull_request(
-                run, item, gate, stage)
+            if last_merged is not None:
+                refreshed = self._refresh_after_sibling_merge(run, item, last_merged)
+                if refreshed:
+                    row["state"], row["error"] = "blocked", refreshed
+                    item.merge_state = "blocked"
+                    continue
+            if (item.work_id in run._deferred_checks
+                    and not run._item_checks.get(item.work_id)):
+                missing = self._author_deferred_check(run, item)
+                if missing:
+                    row["state"], row["error"] = "blocked", missing
+                    item.merge_state = "blocked"
+                    self._comment_work_item(run, item, (
+                        f"**No check was run** ({missing}). The checker did not produce "
+                        "an executable for this pull request, so it has no verdict. A "
+                        "person decides what happens next."))
+                    continue
+            early = run._early_gates.pop(item.work_id, None)
+            if early is not None:
+                # Gated (and, when green, reviewed) during execution; act on it here.
+                gate, approved, stage = early
+            else:
+                stage = f"{item.work_id} round {item.attempt}"
+                run.log(f"gate: running {item.work_id}'s authored check "
+                        f"on {run.final_base_branch}")
+                gate = self._gate_one_pull_request(run, item, stage)
+                approved = gate.get("passed") and self._assess_pull_request(
+                    run, item, gate, stage)
             if not approved and not gate.get("passed"):
                 # A red gate is never approved; say so on the pull request without
                 # asking the reviewer, whose own red-gate branch would say the same.
                 self._assess_pull_request(run, item, gate, stage)
 
             if not approved and item.merge_state != "review_unavailable":
-                # ONE bounded repair for THIS pull request only.
-                if item.attempt >= MAX_ITERATIONS:
+                # ONE bounded repair for THIS pull request only. A dependency
+                # refresh is its own budget: it does not spend the repair.
+                if item.attempt >= MAX_ITERATIONS + item.dependency_refreshes:
                     row["state"] = "blocked"
                     row["error"] = "ITERATION_CAP"
                     item.merge_state = "blocked"
@@ -3414,9 +3502,130 @@ class Engine:
                 continue
             self._merge_if_policy_allows(run, item, row)
             row["pr_url"] = (item.pr or {}).get("pr_url")
+            if item.merge_state == "merged":
+                last_merged = item
 
         self._settle_run(run, items)
         return True
+
+    def _finalize_ready_early(self, run: Run) -> None:
+        """Gate, review and merge green pull requests while a slower builder works.
+
+        Called by the role graph right after the checker wrote this round's checks,
+        before the builders whose checks come later have finished. Only the fast path
+        runs here: in merge order, a pull request whose dependencies are merged is gated
+        on the branch as it stands, reviewed, and merged when green and approved. A red
+        gate, a review finding, or an unavailable review stops this pass; its result is
+        kept, unchanged, for finalization, which owns the bounded repair. So the verdict
+        rules are exactly finalization's; only the time they run moves.
+        """
+        if github.merge_policy() != "auto":
+            return
+        by_id = {w.work_id: w for w in run.work_items.values()}
+        for item in self._builder_items(run, pending_only=True):
+            if (not run._item_checks.get(item.work_id)
+                    or item.work_id in run._deferred_checks
+                    or run.progress[item.agent].state != "done" or not item.pr
+                    or any((by_id.get(d) is not None and by_id[d].merge_state != "merged")
+                           for d in item.depends_on)):
+                break
+            stage = f"{item.work_id} round {item.attempt}"
+            run.log(f"gate: running {item.work_id}'s authored check on "
+                    f"{run.final_base_branch} now, while the other builders work")
+            try:
+                gate = self._gate_one_pull_request(run, item, stage)
+                approved = bool(gate.get("passed")) and self._assess_pull_request(
+                    run, item, gate, stage)
+            except Exception as exc:  # noqa: BLE001 (finalization runs it instead)
+                run.log(f"{item.work_id}: the early gate did not complete ({exc}); "
+                        "finalization runs it", "warn")
+                break
+            if not approved or item.merge_state == "review_unavailable":
+                run._early_gates[item.work_id] = (gate, approved, stage)
+                break
+            row = {"work_id": item.work_id, "agent": item.agent, "role": item.role,
+                   "pr_url": (item.pr or {}).get("pr_url"), "state": "checking"}
+            self._merge_if_policy_allows(run, item, row)
+            row["pr_url"] = (item.pr or {}).get("pr_url")
+            run._early_rows[item.work_id] = row
+            run.role_prs = [r for r in run.role_prs if r.get("work_id") != item.work_id] + [row]
+            if item.merge_state != "merged":
+                break
+
+    def _check_waits_for_dependency(self, run: Run, item: _work_items.WorkItem) -> bool:
+        """Under auto merge, a dependency that will merge first moves this PR's base.
+
+        Writing its check now would grade a branch that is about to change, and the
+        check would be written again after the merge (the base moved). So it waits
+        and is written once. A dependency that failed or already merged does not wait.
+        """
+        if github.merge_policy() != "auto" or not item.depends_on:
+            return False
+        by_id = {w.work_id: w for w in run.work_items.values()}
+        for dep_id in item.depends_on:
+            dep = by_id.get(dep_id)
+            if dep is None or dep.merge_state in ("merged", "blocked"):
+                continue
+            if run.progress.get(dep.agent) is not None and \
+                    run.progress[dep.agent].state == "error":
+                continue
+            return True
+        return False
+
+    def _author_deferred_check(self, run: Run, item: _work_items.WorkItem) -> str:
+        """Write a deferred pull request's check now, on the branch as it stands.
+
+        A checker-only round: no builder runs. Returns "" when a check exists, or the
+        reason none does (the PR is then blocked with no verdict, never graded)."""
+        run._deferred_checks.discard(item.work_id)
+        prior_active, prior_phase = run._active_builders, run.phase
+        run._check_subjects, run._active_builders = {item.work_id}, set()
+        run.log(f"validator: writing {item.work_id}'s check now, against "
+                f"{run.final_base_branch} as it stands")
+        try:
+            self._execute(run, defer_failure=True)
+        finally:
+            run._check_subjects, run._active_builders = None, prior_active
+            run.phase = prior_phase
+        if run._item_checks.get(item.work_id):
+            return ""
+        return run.fail_reason or "CHECK_NOT_AUTHORED"
+
+    def _refresh_after_sibling_merge(
+        self, run: Run, item: _work_items.WorkItem, merged: _work_items.WorkItem
+    ) -> str:
+        """Bring this pull request onto the branch a sibling just merged into.
+
+        The per-PR loop gates each pull request against the default branch AS IT
+        STANDS, so once a sibling merged, a later pull request that changed one of
+        the same paths is stale. Before October 13 nothing refreshed it: its gate
+        reported STALE_PATCH, the ordinary repair re-ran its owner on the OLD base,
+        and the same stale patch came back. A clean rebase is republished without an
+        agent turn; a conflict, or a dependency that just merged, gets its owner one
+        bounded refresh turn on the new base. Returns "" to continue to the gate, or
+        the reason this pull request now needs a person.
+        """
+        try:
+            active = self._refresh_pending_work(run, [item], merged)
+        except RuntimeError as exc:
+            reason = str(exc)
+            if not reason.startswith(("STALE_PATCH_", "ROLE_PR_REFRESH_ERROR:")):
+                raise
+            run.log(reason, "warn")
+            return reason.split(":", 1)[0]
+        if not active:
+            return ""
+        run._active_builders = {item.agent}
+        run.iterations += 1
+        run.log(f"{item.work_id}: one bounded refresh onto the branch "
+                f"{merged.work_id} merged into", "warn")
+        if not self._execute(run, defer_failure=True):
+            self._comment_work_item(run, item, (
+                "**Refresh did not complete.** A sibling pull request merged first and "
+                "this one needed its owner to reconcile the shared paths, but that turn "
+                "stopped before it produced a change. A person decides what happens next."))
+            return run.fail_reason if run.fail_reason in _REPAIR_STOPS else "ROLE_EXECUTION_ERROR"
+        return ""
 
     def _repair_pull_request(
         self, run: Run, item: _work_items.WorkItem, gate: dict, stage: str

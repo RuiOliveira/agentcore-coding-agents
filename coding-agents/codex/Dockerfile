@@ -1,4 +1,5 @@
-ARG WORKSHOP_RUNTIME_BASE_IMAGE
+# Built with named contexts: docker buildx bake <role>, from the repository root (docker-bake.hcl).
+ARG WORKSHOP_RUNTIME_BASE_IMAGE=public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:06da5a3362eda00c5114227ac81abe56dd9b943395553b7c64a310457f4d9e2b
 FROM ${WORKSHOP_RUNTIME_BASE_IMAGE}
 
 RUN dnf install -y --allowerasing \
@@ -26,7 +27,7 @@ RUN curl -fsSL -o /tmp/otelcol.tar.gz \
 
 RUN useradd -m -d /home/agent -u 1000 agent
 
-COPY _toolchain/ /opt/workshop-cli/
+COPY --from=toolchain cli-versions.json cli_versions.py /opt/workshop-cli/
 RUN python3 /opt/workshop-cli/cli_versions.py install --cli codex \
       --home /home/agent --user agent --receipt /opt/workshop-cli/installed.json
 
@@ -38,7 +39,7 @@ RUN python3 -m pip install --quiet $(python3 /opt/workshop-cli/cli_versions.py s
 RUN mkdir -p /home/agent/.codex && chown -R agent:agent /home/agent/.codex
 COPY --chown=agent:agent .codex/config.toml /home/agent/.codex/config.toml
 
-COPY --chown=agent:agent healthcheck.py /app/healthcheck.py
+COPY --chown=agent:agent --from=toolchain healthcheck.py /app/healthcheck.py
 COPY configure_codex.py /app/configure_codex.py
 COPY entrypoint.sh /app/entrypoint.sh
 COPY otel-collector-config.yaml /app/otel-collector-config.yaml
@@ -67,4 +68,5 @@ EXPOSE 8080
 USER agent
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["python3", "/app/healthcheck.py"]
+# /ping: HealthyBusy while the agent CLI runs, so a detached session keeps working.
+CMD ["python3", "/app/healthcheck.py", "--agent", "codex", "--busy", "codex"]

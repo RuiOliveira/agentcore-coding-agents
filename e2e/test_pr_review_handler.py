@@ -11,6 +11,7 @@ import hmac
 import importlib.util
 import json
 import shlex
+import time
 from pathlib import Path
 
 import pytest
@@ -25,9 +26,14 @@ def signed(secret: str, body: bytes) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
-def pr_event(action="opened", draft=False, state="open") -> dict:
+def _now(offset_s: float = 0) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + offset_s))
+
+
+def pr_event(action="opened", draft=False, state="open", updated=None) -> dict:
     return {"action": action, "repository": {"name": "game", "owner": {"login": "octo"}},
             "pull_request": {"number": 7, "title": 'Add "pause"', "draft": draft, "state": state,
+                             "updated_at": updated or _now(), "author_association": "OWNER",
                              "user": {"login": "dev"}, "head": {"sha": "abc1234def"}}}
 
 
@@ -43,20 +49,44 @@ class FakeLambda:
         self.calls.append(kw)
 
 
+class FakeTable:
+    """DynamoDB's conditional put: the first writer of an id wins."""
+    class exceptions:
+        class ConditionalCheckFailedException(Exception):
+            pass
+
+    def __init__(self):
+        self.ids = set()
+        self.broken = None
+
+    def put_item(self, TableName, Item, ConditionExpression):
+        assert ConditionExpression == "attribute_not_exists(id)"
+        if self.broken:
+            raise self.broken
+        if Item["id"]["S"] in self.ids:
+            raise self.exceptions.ConditionalCheckFailedException()
+        self.ids.add(Item["id"]["S"])
+
+    def delete_item(self, TableName, Key):
+        self.ids.discard(Key["id"]["S"])
+
+
 class FakeSession:
-    def __init__(self, lam):
-        self.lam = lam
+    def __init__(self, lam, table=None):
+        self.lam, self.table = lam, table or FakeTable()
 
     def client(self, name, **_):
-        assert name == "lambda", name
-        return self.lam
+        assert name in ("lambda", "dynamodb"), name
+        return self.lam if name == "lambda" else self.table
 
 
 @pytest.fixture
 def lam(monkeypatch):
     fake = FakeLambda()
-    monkeypatch.setattr(hook, "_session", FakeSession(fake))
+    fake.session = FakeSession(fake)
+    monkeypatch.setattr(hook, "_session", fake.session)
     monkeypatch.setattr(hook, "webhook_secret", lambda: "s3cret")
+    monkeypatch.setenv("DELIVERIES_TABLE", "coding-agents-pr-review-deliveries")
     return fake
 
 
@@ -92,6 +122,105 @@ def test_only_a_reviewable_pull_request_starts_a_session(lam):
     assert call(pr_event("synchronize"), "pull_request")["statusCode"] == 202 and len(lam.calls) == 1
 
 
+def test_a_team_builds_pull_request_is_left_to_its_own_gate_and_review(lam):
+    """Part 4's coordinator opens its pull requests from workshop/runs/... branches in
+    the same repository part 3 connected; each already has an executed check and an
+    independent Assessment, so the event reviewer adds no second verdict."""
+    team = pr_event()
+    team["pull_request"]["head"]["ref"] = "workshop/runs/run-153232-c415c8e32151/codex-4920a1"
+    assert call(team, "pull_request")["statusCode"] == 202 and lam.calls == []
+    person = pr_event()
+    person["pull_request"]["head"]["ref"] = "add-pause"
+    call(person, "pull_request")
+    assert len(lam.calls) == 1
+
+
+def test_a_signed_event_is_acted_on_once(lam):
+    """A redelivery or a replay of the same signed body starts nothing new."""
+    body = pr_event()
+    assert call(body, "pull_request")["statusCode"] == 202
+    again = call(body, "pull_request")
+    assert again["statusCode"] == 202 and "already handled" in again["body"]
+    assert len(lam.calls) == 1
+
+
+def test_a_stranger_s_pull_request_never_reaches_a_session(lam):
+    """The review runs the change; a fork from someone the repository does not trust must
+    not get a microVM with the Runtime's role and the shared mount."""
+    for association in ("NONE", "FIRST_TIME_CONTRIBUTOR", "CONTRIBUTOR", None):
+        event = pr_event()
+        event["pull_request"]["author_association"] = association
+        assert call(event, "pull_request")["statusCode"] == 202
+    assert lam.calls == []
+
+
+def _from(event, head_repo, association, login="dev"):
+    event["repository"]["full_name"] = "octo/game"
+    event["pull_request"]["head"]["repo"] = {"full_name": head_repo} if head_repo else None
+    event["pull_request"]["author_association"] = association
+    event["pull_request"]["user"] = {"login": login, "type": "Bot" if login.endswith("[bot]") else "User"}
+    return event
+
+
+def test_the_fixers_own_pull_request_is_reviewed(lam):
+    """The App opens the fixer's pull request from a branch of the same repository; its
+    association is not OWNER, and a different session must still review the fix."""
+    assert call(_from(pr_event(), "octo/game", "NONE", "workshop-app[bot]"), "pull_request")["statusCode"] == 202
+    assert len(lam.calls) == 1
+
+
+def test_a_strangers_fork_is_not_reviewed_but_an_owners_fork_is(lam):
+    call(_from(pr_event(), "stranger/game", "NONE", "stranger"), "pull_request")
+    call(_from(pr_event(), "stranger/game", "FIRST_TIME_CONTRIBUTOR", "stranger"), "pull_request")
+    assert lam.calls == []
+    call(_from(pr_event(), "octo-fork/game", "OWNER", "octo"), "pull_request")
+    assert len(lam.calls) == 1
+
+
+def test_a_failed_hand_off_can_be_redelivered(lam):
+    """If the asynchronous hand-off raises, the digest is forgotten, so GitHub's
+    Redeliver of the same body is acted on instead of answered 'already handled'."""
+    body = pr_event()
+
+    def refuse(**kw):
+        raise RuntimeError("TooManyRequestsException")
+
+    lam.invoke = refuse
+    with pytest.raises(RuntimeError):
+        call(body, "pull_request")
+    assert lam.session.table.ids == set()
+    del lam.invoke
+    assert call(body, "pull_request")["statusCode"] == 202 and len(lam.calls) == 1
+
+
+def test_an_unreachable_table_answers_503_not_a_crash(lam):
+    class ClientError(Exception):
+        response = {"Error": {"Code": "AccessDeniedException"}}
+
+    lam.session.table.broken = ClientError("denied")
+    r = call(pr_event(), "pull_request")
+    assert r["statusCode"] == 503 and lam.calls == []
+
+
+def test_a_pull_request_from_a_deleted_fork_is_not_reviewed(lam):
+    call(_from(pr_event(), None, "NONE", "gone"), "pull_request")
+    assert lam.calls == []
+
+
+def test_a_stale_signed_event_is_ignored(lam):
+    """GitHub's signature carries no time, so the event's own time bounds a replay."""
+    r = call(pr_event(updated=_now(-2 * hook.REPLAY_WINDOW_S)), "pull_request")
+    assert r["statusCode"] == 202 and "replay window" in r["body"]
+    no_time = pr_event()
+    del no_time["pull_request"]["updated_at"]
+    call(no_time, "pull_request")
+    assert lam.calls == []
+
+
+def test_the_endpoint_reads_the_webhook_secret_never_the_app_key():
+    assert hook.SECRET_ID == "agentcore/github-mcp/webhook"
+
+
 def test_no_secret_means_refuse_never_accept_unsigned(lam, monkeypatch):
     monkeypatch.setattr(hook, "webhook_secret", lambda: "")
     assert call(pr_event(), "pull_request")["statusCode"] == 503
@@ -104,6 +233,7 @@ def fix_comment(body="/fix please", association="OWNER", user_type="User", on_pr
         issue["pull_request"] = {"url": "x"}
     return {"action": "created", "repository": {"name": "game", "owner": {"login": "octo"}},
             "issue": issue, "comment": {"body": body, "author_association": association,
+                                        "created_at": _now(),
                                         "user": {"login": "dev", "type": user_type}}}
 
 
@@ -182,3 +312,30 @@ def test_the_review_is_read_between_its_markers():
 def test_the_review_session_does_not_claim_a_kernel_identity():
     command = hook.build_command({"owner": "o", "repo": "r", "number": 1, "title": "t", "author": "a"}, "+x")
     assert "boot_id" not in command, "sessions share a boot ID; it identifies nothing"
+
+
+def test_the_team_branch_prefix_matches_the_engine():
+    source = (SOURCE.parents[2] / "orchestrator" / "work_items.py").read_text()
+    assert 'branch=f"' + hook.TEAM_BUILD_BRANCH in source
+
+
+def test_rules_come_from_the_default_branch_so_a_stacked_fix_is_judged_by_them(monkeypatch):
+    """Part 3's /fix opens a pull request whose base is the feature branch, which was
+    created before REVIEW.md landed on main; reading the rules from that base gave the
+    fix's reviewer no rules at all."""
+    asked = []
+
+    def tool(url, name, args, raw=False):
+        asked.append((name, args.get("path"), args.get("ref")))
+        return "# rules" if args.get("path") == hook.RULES_FILE else "code"
+
+    monkeypatch.setattr(hook, "tool", tool)
+    job = hook.job_from_event("pull_request", {
+        **pr_event(), "repository": {"name": "game", "owner": {"login": "octo"},
+                                     "default_branch": "main"}})
+    assert job["default_branch"] == "main"
+    pr = {"files": [{"filename": "discount.py", "status": "modified"}], "head_sha": "abc",
+          "base": "add-pause"}
+    _files, rules = hook.gather("https://gw", job, pr)
+    assert rules == "# rules"
+    assert (("get_file", hook.RULES_FILE, "main")) in asked

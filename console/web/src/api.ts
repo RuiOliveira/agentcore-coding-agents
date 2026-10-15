@@ -522,12 +522,14 @@ export const clearKiroKey = () =>
 //   'environment' : AGENTCORE_RUNTIME_<ROLE>, an operator override.
 //   'settings'    : .runs/runtime.local.json, what THIS pane writes.
 //   'deployed'    : auto-discovered from coding-agents/<role>/runtime_config.json,
-//                   which is how every role the EVENT STACK pre-provisioned surfaces.
+//                   which is how a Runtime deploy.py created surfaces.
+//   'named'       : the Runtime NAMED after the role in this region (claude_code),
+//                   which is how a Runtime created in the AgentCore console surfaces.
 // Only 'settings' is removable here: remove_runtime edits the settings layer, so
 // asking it to remove an 'environment' or 'deployed' ARN is a silent no-op. This union
 // omitted 'deployed', which is exactly why the UI never modeled that distinction and
 // offered a dead remove button on every pre-provisioned runtime.
-export type RuntimeSource = 'environment' | 'settings' | 'deployed';
+export type RuntimeSource = 'environment' | 'settings' | 'deployed' | 'named';
 
 export interface RuntimeInstance {
   arn: string;

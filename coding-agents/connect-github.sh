@@ -35,6 +35,18 @@ if [ -z "${GITHUB_APP_WEBHOOK_SECRET:-}" ]; then
 fi
 ./deploy-all.sh
 
+# Save the repository and the Gateway for every later terminal. This script's export
+# ends with it, and github.py doctor and Lab 4's coordinator read the saved values.
+GATEWAY_URL="$(jq -r '.gateway_url // empty' .deployed-state.json)" \
+PYTHONPATH="$here/../orchestrator${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'PY'
+import os
+import github
+result = github.save_settings(repo=os.environ["GITHUB_REPO"],
+                              gateway_url=os.environ.get("GATEWAY_URL") or None)
+if result.get("error"):
+    raise SystemExit("Could not save the GitHub settings: " + result["error"])
+PY
+
 echo
 echo "Connected. An agent now wakes up for every pull request in $repo."
 echo "Open one on GitHub (edit any file in the web editor and choose 'Create a new branch"

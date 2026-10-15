@@ -36,6 +36,10 @@ os.environ.pop("WORKSHOP_RUNTIME_BUCKET", None)
 # once a diagnostic attached it, every later fixture save was mirrored into it.
 # Discovery is off for the suite; tests of discovery itself turn it back on.
 os.environ["WORKSHOP_RUN_MIRROR_DISCOVERY"] = "0"
+# runtime_config finds a console-created Runtime by its NAME, which lists the real
+# account's Runtimes. The suite must never do that; tests of the lookup turn it on
+# with a fake listing.
+os.environ["WORKSHOP_RUNTIME_NAME_DISCOVERY"] = "0"
 # Credential store -> empty tmp file (no developer PAT on the ladder). Runtime ARN
 # config -> empty tmp file (no real wired runtime). Both read these env vars at
 # import by design. setdefault so a more specific package conftest / a test that

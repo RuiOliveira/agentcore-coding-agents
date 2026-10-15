@@ -8,7 +8,7 @@
 
 Why this exists. The console renders the live per-role feed in-process, and
 ``watch_agents.py`` attaches to the console's multiplexed Runtime PTYs -- but the SERVED
-Lab 2 path is a coordinator deployed into its own AgentCore Runtime. Its engine runs
+Lab 4 path is a coordinator deployed into its own AgentCore Runtime. Its engine runs
 somewhere the attendee cannot attach to, so the only window used to be a chat turn per
 poll: about a minute of model time to learn one line of state, which is the opposite of
 watching. Meanwhile the engine was already recording exactly the right thing.
@@ -166,10 +166,13 @@ def _home() -> str:
 
 def _start_hint(target: str) -> str:
     port = run_advice.port_for(target)
+    if target == "~/team-game" or target.startswith("~/team-game-"):
+        return ("Its README names its one start command. Publish it to the event gallery "
+                "with that command after --, as Share What You Built shows.")
     if target == "~/game":
-        return "Continue with Play Your Game (Lab 2)."
+        return "Play it: the README names its start command."
     if port:
-        return (f"Start it on port {port}, as Lab 3 shows; ~/game keeps its own copy "
+        return (f"Start it on port {port}; ~/game keeps its own copy "
                 "and saved scores.")
     return ("Start it on a free port (not 8000 or 8001, where the earlier games run), "
             f"then print its URL: python3 {_REPO_DIR}/orchestrator/workshop_urls.py <port>")
@@ -178,7 +181,7 @@ def _start_hint(target: str) -> str:
 def _checkout_steps(rec: dict, para, lead: str) -> list[str]:
     """The checkout command for this run's lab, or why the natural folder is taken."""
     target, taken = run_advice.checkout_target(rec, _home())
-    natural = "~/game-lab3" if run_advice.is_chat_build(rec) else "~/game"
+    natural = "~/" + run_advice.natural_folder(rec)
     lines: list[str] = []
     command = f"python3 orchestrator/github.py checkout {target}"
     if taken:
@@ -257,12 +260,15 @@ def _what_now(rec: dict, ink: _Ink, width: int) -> list[str]:
                       "check comment and Assessment, and merge it yourself (the engine "
                       "never merges a red PR; a person can). Then run:", lead="  a. ")
         lines += _checkout_steps(rec, para, lead="     ")
-        if chat:
+        if run_advice.is_team_build(rec):
+            lines += para("Or leave it open as the evidence: the pull request keeps its "
+                          "check, its SHA-256, and the Assessment.", lead="  b. ")
+        elif chat:
             lines += para("Or leave it open: read Next action in Agent Studio, keep the "
                           "evidence, and ask your facilitator if the check itself looks "
                           "wrong.", lead="  b. ")
         else:
-            lines += para("Or rerun Run a Build step 1 with a simpler direction: one core "
+            lines += para("Or rerun Build and Run the Team step 6 with a simpler direction: one core "
                           "mechanic, one short round. It creates a NEW session ID; this "
                           "run stays recorded.", lead="  b. ")
         lines += para("Do not resubmit the same request to retry a red pull request.")
@@ -273,7 +279,7 @@ def _what_now(rec: dict, ink: _Ink, width: int) -> list[str]:
     if rec.get("next_action"):
         lines += para(" ".join(str(rec["next_action"]).split()))
     if reason == "COORDINATOR_SESSION_INTERRUPTED" and not chat:
-        lines += para("Submit it again with Run a Build step 1, which creates a new "
+        lines += para("Submit it again with Build and Run the Team step 6, which creates a new "
                       "session ID.")
     lines += para("For help, send this output and the read-only progress check to a "
                   "helper:")

@@ -1,8 +1,9 @@
 """Wake a Claude Code session on AgentCore Runtime when a pull request needs an agent.
 
 GitHub calls this function's HTTP endpoint for every event of the workshop App. The
-function checks GitHub's signature, answers within a second, and hands the work to an
-asynchronous copy of itself. Two events start work:
+function checks GitHub's signature, acts on each signed body once and only while it is
+fresh (the signature carries no time), answers within a second, and hands the work to an
+asynchronous copy of itself, which is never retried. Two events start work:
 
 * A pull request is opened, reopened, updated, or marked ready: a **reviewer** session.
 * A trusted person comments ``/fix`` on a pull request: a **fixer** session, which opens
@@ -14,14 +15,17 @@ For each job the copy:
 1. finds the attendee's Claude Code Runtime (``claude_code``) and the GitHub Gateway,
 2. posts "an agent woke up" on the pull request,
 3. reads the change through the Gateway: the diff, the changed files at the head commit,
-   and the repository's review rules (``REVIEW.md`` on the base branch, so a pull request
+   and the repository's review rules (``REVIEW.md`` on the default branch, so a pull request
    cannot rewrite the rules it is judged by),
 4. starts a NEW Runtime session (its own microVM) with that bundle; the agent may run the
-   code there, because the microVM is discarded afterwards,
+   code there. That is containment, not a sandbox: the session keeps the Runtime's role,
+   the shared mount, and the internet, which is why only a branch of this repository or a
+   pull request from someone GitHub associates with it is reviewed,
 5. posts the result back through the Gateway.
 
-The GitHub credential never enters the Runtime: the Gateway's GitHub tools hold it, and
-the session receives files, not a token.
+The GitHub credential never enters the Runtime: the Gateway's GitHub tools hold the App
+key, this function reads only the webhook secret, and the session receives files, not a
+token.
 """
 from __future__ import annotations
 
@@ -40,14 +44,23 @@ import urllib.error
 import urllib.request
 import uuid
 
-SECRET_ID = "agentcore/github-mcp/github-app"
+# The webhook secret alone (deploy-credential.sh writes it beside the App's key, which
+# this function never reads: only the Gateway's GitHub tools hold the key).
+SECRET_ID = "agentcore/github-mcp/webhook"
+# GitHub's signature has no timestamp, so a captured delivery stays validly signed. The
+# endpoint acts on each signed body once, and only while it is fresh.
+REPLAY_WINDOW_S = 3600
 GATEWAY_NAME = "github-mcp-gateway"
 RUNTIME_NAME = "claude_code"
 TARGET = "GitHubMCP"
 RULES_FILE = "REVIEW.md"
 ACTIONS = {"opened", "reopened", "synchronize", "ready_for_review"}
-# Who may ask for a fix: people with write access, never a bot (so an agent's own
-# comment can never start another agent).
+# The branch prefix the coordinator's engine gives every team pull request
+# (orchestrator/work_items.py). Those are judged by their own gate and review.
+TEAM_BUILD_BRANCH = "workshop/runs/"
+# Who may ask for a fix, by GitHub's author_association: the owner, the organization's
+# members, and collaborators; never a bot, so an agent's own comment cannot start another
+# agent. (A member or collaborator is not necessarily someone with write access.)
 TRUSTED = {"OWNER", "MEMBER", "COLLABORATOR"}
 # One InvokeAgentRuntimeCommand command allows 65,536 characters. The bundle is a
 # base64 tar.gz of the diff, the changed files and the rules; the prompt takes the rest.
@@ -62,21 +75,23 @@ REVIEW_PROMPT = (
     "You are reviewing pull request #{number} \"{title}\" by {author} in {repo}, alone in a "
     "microVM that is discarded when you finish. In this folder: pr.diff (each added or "
     "unchanged line starts with its line number in the new file), src/ (the changed files as "
-    "of the pull request's head commit), and RULES.md (the repository's review rules from "
-    "its base branch; it may be empty). You may run the code in src/ to prove a problem. "
+    "of the pull request's head commit), and REVIEW.md (the repository's review rules from "
+    "its default branch; it may be empty). Apply those rules, including any about the "
+    "review's tone. You may run the code in src/ to prove a problem. "
     "Write the review in GitHub Markdown: a one-sentence summary; then at most five findings, "
     "each a definite problem naming the file by its repository path (without src/) and the "
     "line, why it matters, and a concrete fix, in "
     "one or two sentences; when you ran something to prove a finding, add the command and its "
-    "real output as one short inline code span; when a finding applies a RULES.md rule, say "
+    "real output as one short inline code span; when a finding applies a REVIEW.md rule, say "
     "which. End with a line that is exactly 'Verdict: looks good' or 'Verdict: needs changes'. "
     "Skip anything you are unsure of and do not restate the diff. Print only the review."
 )
 FIX_PROMPT = (
     "You are fixing pull request #{number} \"{title}\" in {repo}, alone in a microVM that is "
     "discarded when you finish. In this folder: pr.diff (the change), src/ (the changed files "
-    "as of its head commit), REVIEW.md (the latest review of it), RULES.md (the repository's "
-    "rules; it may be empty), and REQUEST.md (what the person asked for, if anything). Fix the "
+    "as of its head commit), LATEST-REVIEW.md (the latest review of it), REVIEW.md (the "
+    "repository's review rules; it may be empty), and REQUEST.md (what the person asked for, "
+    "if anything). Fix the "
     "problems the review lists by editing files under src/ only, keep everything else the "
     "same, and run the code to check your fix. Then print a short Markdown list with one line "
     "per file you changed and what you changed. Print only that list."
@@ -118,6 +133,50 @@ def webhook_secret() -> str:
     return value.get("webhook_secret") or ""
 
 
+def event_time(kind: str, payload: dict) -> float | None:
+    """When GitHub says the thing happened: the pull request's update, or the comment."""
+    from datetime import datetime
+    item = payload.get("pull_request") if kind == "pull_request" else payload.get("comment")
+    stamp = (item or {}).get("updated_at" if kind == "pull_request" else "created_at") or ""
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+class DedupeUnavailable(Exception):
+    """The table of handled events could not be read or written."""
+
+
+def first_time(digest: str) -> bool:
+    """Record this body's digest; False when it was handled before (a redelivery or a replay)."""
+    table = os.environ.get("DELIVERIES_TABLE", "")
+    if not table:
+        return True
+    ddb = _boto().client("dynamodb", region_name=region())
+    try:
+        ddb.put_item(TableName=table, ConditionExpression="attribute_not_exists(id)",
+                     Item={"id": {"S": digest},
+                           "expires": {"N": str(int(time.time()) + 2 * REPLAY_WINDOW_S)}})
+    except ddb.exceptions.ConditionalCheckFailedException:
+        return False
+    except Exception as exc:  # noqa: BLE001 (botocore ClientError or a transport failure)
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code", type(exc).__name__)
+        raise DedupeUnavailable(code) from exc
+    return True
+
+
+def forget(digest: str) -> None:
+    """Undo first_time when the hand-off failed, so GitHub's Redeliver can try again."""
+    table = os.environ.get("DELIVERIES_TABLE", "")
+    if table:
+        try:
+            _boto().client("dynamodb", region_name=region()).delete_item(
+                TableName=table, Key={"id": {"S": digest}})
+        except Exception as exc:  # noqa: BLE001 (best effort; the event is already failing)
+            log("FORGET_FAILED", error=type(exc).__name__)
+
+
 def signature_ok(secret: str, body: bytes, header: str) -> bool:
     if not secret or not header.startswith("sha256="):
         return False
@@ -128,12 +187,27 @@ def signature_ok(secret: str, body: bytes, header: str) -> bool:
 def job_from_event(kind: str, payload: dict) -> dict | None:
     """The job an event asks for, or None when it needs no agent."""
     repo = payload.get("repository") or {}
-    where = {"owner": (repo.get("owner") or {}).get("login", ""), "repo": repo.get("name", "")}
+    where = {"owner": (repo.get("owner") or {}).get("login", ""), "repo": repo.get("name", ""),
+             "default_branch": repo.get("default_branch", "")}
     if kind == "pull_request":
         if payload.get("action") not in ACTIONS:
             return None
         pr = payload.get("pull_request") or {}
         if pr.get("draft") or pr.get("state") != "open":
+            return None
+        # A team build's pull request (Lab 4's coordinator, branch workshop/runs/...)
+        # already carries its own executed check and independent review. A second,
+        # REVIEW.md-based verdict beside them would blur which one decides.
+        if str((pr.get("head") or {}).get("ref", "")).startswith(TEAM_BUILD_BRANCH):
+            return None
+        # The reviewer runs the change with the Runtime's role, the shared mount, and the
+        # internet, so only code the repository trusts reaches a session: a branch of this
+        # repository (whoever pushed it had write access, including the App that opens the
+        # fixer's pull request) or a fork by someone GitHub associates with it.
+        head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+        base_repo = ((pr.get("base") or {}).get("repo") or {}).get("full_name") or repo.get("full_name")
+        same_repo = bool(head_repo) and head_repo == base_repo  # a deleted fork has no head repo
+        if not same_repo and pr.get("author_association") not in TRUSTED:
             return None
         return {"mode": "review", **where, "number": pr["number"], "title": pr.get("title", ""),
                 "author": (pr.get("user") or {}).get("login", ""), "sha": pr["head"]["sha"]}
@@ -171,12 +245,29 @@ def handler(event, context):
     job = job_from_event(kind, payload)
     if job is None:
         return response(202, f"Ignored {kind} event.")
+    happened = event_time(kind, payload)
+    if happened is None or time.time() - happened > REPLAY_WINDOW_S:
+        log("REJECTED", reason="stale", event=kind)
+        return response(202, "Ignored: older than the replay window.")
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        fresh = first_time(digest)
+    except DedupeUnavailable as exc:
+        log("REJECTED", reason="dedupe unavailable", error=str(exc), event=kind)
+        return response(503, "Could not record the event; ask GitHub to redeliver it.")
+    if not fresh:
+        log("REJECTED", reason="already handled", event=kind)
+        return response(202, "Ignored: this event was already handled.")
     job["received_at"] = time.time()
     log("EVENT", event=kind, action=payload.get("action"), repo=f"{job['owner']}/{job['repo']}",
         number=job["number"], mode=job["mode"])
-    _boto().client("lambda", region_name=region()).invoke(
-        FunctionName=context.invoked_function_arn, InvocationType="Event",
-        Payload=json.dumps({"job": job}).encode())
+    try:
+        _boto().client("lambda", region_name=region()).invoke(
+            FunctionName=context.invoked_function_arn, InvocationType="Event",
+            Payload=json.dumps({"job": job}).encode())
+    except Exception:
+        forget(digest)
+        raise
     verb = "fix" if job["mode"] == "fix" else "review"
     return response(202, f"An agent is waking up to {verb} this pull request.")
 
@@ -277,7 +368,11 @@ def build_diff(pr: dict) -> str:
 
 
 def gather(url: str, job: dict, pr: dict) -> tuple[dict[str, str], str]:
-    """The changed files at the head commit (bounded) and the base branch's rules."""
+    """The changed files at the head commit (bounded) and the repository's rules.
+
+    Rules come from the DEFAULT branch: a pull request cannot rewrite the rules it is
+    judged by until it merges, and a fix pull request stacked on a feature branch (part
+    3's /fix) is judged by the same rules as the pull request it fixes."""
     where = {"owner": job["owner"], "repo": job["repo"]}
     files, total = {}, 0
     for f in pr.get("files", []):
@@ -293,7 +388,8 @@ def gather(url: str, job: dict, pr: dict) -> tuple[dict[str, str], str]:
         files[f["filename"]] = text
         total += size
     try:
-        rules = tool(url, "get_file", {**where, "path": RULES_FILE, "ref": pr["base"]}, raw=True)
+        ref = job.get("default_branch") or pr["base"]
+        rules = tool(url, "get_file", {**where, "path": RULES_FILE, "ref": ref}, raw=True)
     except Exception:  # noqa: BLE001 (no rules file is the common case)
         rules = ""
     return files, rules if isinstance(rules, str) else ""
@@ -401,13 +497,14 @@ def review(job: dict) -> dict:
     pr = tool(url, "get_pull_request_files",
               {"owner": job["owner"], "repo": job["repo"], "number": job["number"]})
     files, rules = gather(url, job, pr)
-    encoded, dropped = fit_bundle(build_diff(pr), files, {"RULES.md": rules})
+    encoded, dropped = fit_bundle(build_diff(pr), files, {RULES_FILE: rules})
     log("SESSION", mode="review", number=job["number"], session=session, files=len(files) - len(dropped),
         rules=bool(rules))
     stdout, code = run_session(runtime_arn(), session, build_command(job, encoded))
     text = extract_review(stdout)
     seconds = time.time() - job.get("received_at", started)
-    rules_note = f" It applied the rules in `{RULES_FILE}` on `{pr['base']}`." if rules else ""
+    rules_note = (f" It applied the rules in `{RULES_FILE}` on `{job.get('default_branch') or pr['base']}`."
+                  if rules else "")
     if code == 0 and text:
         body = (f"{REVIEW_HEADING}\n\n{text}\n\n---\n"
                 f"Reviewed commit `{job['sha'][:7]}` in a new session of its own (`{session[-12:]}`), "
@@ -452,7 +549,7 @@ def fix(job: dict) -> dict:
         "and opens a separate pull request against this branch; a different agent then reviews "
         "that fix.")})
     files, rules = gather(url, job, pr)
-    extras = {"RULES.md": rules, "REVIEW.md": review_text, "REQUEST.md": job.get("request", "")}
+    extras = {RULES_FILE: rules, "LATEST-REVIEW.md": review_text, "REQUEST.md": job.get("request", "")}
     encoded, dropped = fit_bundle(build_diff(pr), files, extras)
     sent = {p: t for p, t in files.items() if p not in dropped}
     log("SESSION", mode="fix", number=job["number"], session=session, files=len(sent))

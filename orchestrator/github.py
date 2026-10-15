@@ -421,6 +421,8 @@ def save_settings(repo: str, gateway_url: str | None = None,
         os.chmod(_RUNS_DIR, 0o700)
     except OSError:
         pass
+    # The settings file may live elsewhere (the console reads the attendee's clone).
+    os.makedirs(os.path.dirname(_SETTINGS) or ".", mode=0o700, exist_ok=True)
     with open(_SETTINGS, "w", encoding="utf-8") as f:
         json.dump(file, f)
     os.chmod(_SETTINGS, 0o600)
@@ -804,7 +806,7 @@ def _missing_gateway_config_hint() -> str:
                 f"is auto-discovered) or export GITHUB_GATEWAY_URL. {tail}")
     return ("neither the GitHub MCP Gateway URL nor the target repository resolved. "
             "Deploy the Gateway, then export GITHUB_GATEWAY_URL and GITHUB_REPO "
-            "(Connect GitHub, step 4) or set owner/name in console Settings, and run "
+            "(Lab 3, Connect GitHub, step 1) or set owner/name in console Settings, and run "
             f"`python3 orchestrator/github.py doctor` again. {tail}")
 
 
@@ -1051,6 +1053,10 @@ def post_review(run: Any, body_md: str) -> dict[str, Any]:
 # The ports the pages start each checkout on: Lab 2 plays ~/game on 8000, and Lab 3
 # starts ~/game-lab3 on 8001 so the original keeps running beside it.
 _PLAY_PORTS = {"game": 8000, "game-lab3": 8001}
+# Part 4 (and its Go further follow-up) publish the team's game to the event gallery
+# straight from the checkout, so the hint is the Share What You Built page, not a local play port.
+# October 13 live walk: the old hint told the room to ask Claude Code to start it.
+_GALLERY_PORTS = {"team-game": 8000, "team-game-v2": 8001}
 
 
 def _print_play_hint(destination: str) -> None:
@@ -1068,7 +1074,15 @@ def _print_play_hint(destination: str) -> None:
         shown = destination
         if home and destination.startswith(home.rstrip("/") + "/"):
             shown = "~/" + destination[len(home.rstrip("/")) + 1:]
-        port = _PLAY_PORTS.get(os.path.basename(destination.rstrip("/")))
+        name = os.path.basename(destination.rstrip("/"))
+        if name in _GALLERY_PORTS:
+            print(f"\nNext: run the setup its README names (for a Node game, cd {shown} && "
+                  "npm install), then publish it with its start command after --:")
+            print("  cd ~/sample-amazon-bedrock-agentcore-coding-agents && python3 "
+                  f"orchestrator/gallery.py publish --project {shown} --port "
+                  f"{_GALLERY_PORTS[name]} -- npm start")
+            return
+        port = _PLAY_PORTS.get(name)
         if not port:
             # Any other folder is a separate copy. 8000 and 8001 already serve the
             # pages' games, so naming either would open the old game or fail to bind.

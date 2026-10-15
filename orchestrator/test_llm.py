@@ -202,3 +202,31 @@ def test_openai_404_falls_back_to_sibling(monkeypatch):
     out = llm.invoke("openai.gpt-5.5", "Reply OK", max_tokens=64)
     assert out["model_id"] == "openai.gpt-5.4"
     assert calls == ["openai.gpt-5.5", "openai.gpt-5.4"]
+
+
+class _Converse:
+    def __init__(self, reject_effort=False):
+        self.calls, self.reject_effort = [], reject_effort
+
+    def converse(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.reject_effort and "additionalModelRequestFields" in kwargs:
+            raise RuntimeError("ValidationException: unsupported field")
+        return {"output": {"message": {"content": [{"text": "{}"}]}},
+                "usage": {"inputTokens": 1, "outputTokens": 1}}
+
+
+def test_plain_claude_calls_send_effort_and_retry_without_it(monkeypatch):
+    import boto3
+    client = _Converse()
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: client)
+    llm.invoke("global.anthropic.claude-sonnet-5", "hi", effort="low")
+    assert client.calls[0]["additionalModelRequestFields"] == {"output_config": {"effort": "low"}}
+    old = _Converse(reject_effort=True)
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: old)
+    assert llm.invoke("global.anthropic.claude-sonnet-5", "hi", effort="low")["text"] == "{}"
+    assert len(old.calls) == 2 and "additionalModelRequestFields" not in old.calls[1]
+    plain = _Converse()
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: plain)
+    llm.invoke("global.anthropic.claude-sonnet-5", "hi")
+    assert "additionalModelRequestFields" not in plain.calls[0]

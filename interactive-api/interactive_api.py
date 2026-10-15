@@ -125,7 +125,7 @@ def _opencode_region() -> str:
 # Cheap background model for opencode (titles/summaries). Same wirable seam as
 # the two above; must be an inference profile, never a bare model id.
 _SMALL_MODEL = "amazon-bedrock/" + os.environ.get(
-    "WORKSHOP_SMALL_MODEL", "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    "WORKSHOP_SMALL_MODEL", "global.anthropic.claude-sonnet-5"
 ).removeprefix("amazon-bedrock/")
 
 _OS_USER = getpass.getuser()
@@ -286,7 +286,7 @@ def _real_runtime_for(agent_id: str) -> dict | None:
         with open(path, encoding="utf-8") as f:
             cfg = json.load(f)
     except (OSError, ValueError):
-        return None
+        return _named_runtime_for(agent_id)
     arn = cfg.get("runtime_arn", "")
     if isinstance(arn, str) and _REAL_ARN_RE.match(arn):
         # deployed_at: the config file's mtime is when deploy.py wrote the ARN.
@@ -299,6 +299,23 @@ def _real_runtime_for(agent_id: str) -> dict | None:
                 "runtime_id": cfg.get("runtime_id", ""), "region": cfg.get("region", ""),
                 "deployed_at": deployed_at}
     return None
+
+
+def _named_runtime_for(agent_id: str) -> dict | None:
+    """A Runtime created in the AgentCore console has no runtime_config.json; it is
+    found by its name (``claude-code`` -> ``claude_code``), the same lookup the
+    orchestrator's wiring uses. None when it does not exist (or cannot be listed)."""
+    try:
+        import runtime_config  # noqa: PLC0415  (the orchestrator is on the console's path)
+        arn = runtime_config.named_runtime(agent_id)
+    except Exception:  # noqa: BLE001
+        return None
+    match = _REAL_ARN_RE.match(arn or "")
+    if not match:
+        return None
+    region = arn.split(":")[3]
+    return {"runtime_arn": arn, "endpoint": "DEFAULT",
+            "runtime_id": arn.rsplit("/", 1)[-1], "region": region, "deployed_at": None}
 
 
 def _deploy_agent(agent: dict) -> None:
@@ -1128,7 +1145,7 @@ def _harness_files(agent_id: str) -> dict[str, str]:
             '  "provider": { "amazon-bedrock": { "options": '
             f'{{ "region": "{_opencode_region()}" }} }} }},\n'
             f'  "model": "{_OPENCODE_MODEL}",\n'
-            '  "small_model": "amazon-bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"\n'
+            '  "small_model": "amazon-bedrock/global.anthropic.claude-sonnet-5"\n'
             "}\n")
     return files
 

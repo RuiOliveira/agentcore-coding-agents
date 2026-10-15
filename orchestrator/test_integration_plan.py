@@ -130,3 +130,17 @@ def test_repair_router_selects_an_owner_and_falls_back_to_all_builders(
         "build anything", plan, items, {"gate": "red"})
     assert selected == ["claude-code", "opencode"]
     assert "every builder" in reason
+
+
+def test_every_plan_call_asks_for_low_effort(monkeypatch):
+    """October 13: at the model's default effort the team-game brief overran its
+    2,500-token cap, arrived as truncated JSON, and cost a repair call before any
+    builder started; at low it was valid in about ten seconds."""
+    valid = integration_plan.create("build anything", _items(), offline_fixture=True)
+    efforts = []
+    monkeypatch.setattr(
+        integration_plan.llm, "invoke",
+        lambda *args, **kwargs: (efforts.append(kwargs.get("effort"))
+                                 or {"text": json.dumps(valid)}))
+    integration_plan.create("build anything", _items())
+    assert efforts == ["low"]

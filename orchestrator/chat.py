@@ -29,6 +29,7 @@ import threading
 from typing import Any, Iterator
 
 import engine as _engine          # the in-process build engine
+import github as _github          # the merge policy the schedule depends on
 import policy as _policy          # the guardrail exec_command is screened against
 import presets as _presets        # role selection (never task classification)
 import roles as _roles            # the ONE declarative roster (configurable)
@@ -336,15 +337,20 @@ def _wired_roles() -> set[str]:
 
 
 def _schedule(agents: list[str]) -> list[dict[str, str]]:
+    # Under auto merge a team build checks each pull request as soon as it can be
+    # judged (engine._finalize_ready_early), so the chat must not say the checker waits
+    # for every builder: a live October 13 reply did, while the watcher showed it start.
+    builders = sum(_roles.BY_ID[a].kind == _roles.BUILDER for a in agents)
+    checker_timing = ("as soon as each builder's pull request can be judged; one that "
+                      "depends on another is checked after that one merges"
+                      if builders > 1 and _github.merge_policy() == "auto"
+                      else "after every selected builder finishes")
     return [
         {
             "agent": agent_id,
             "kind": _roles.BY_ID[agent_id].kind,
-            "timing": (
-                "after every selected builder finishes"
-                if _roles.BY_ID[agent_id].kind == _roles.CHECKER
-                else "starts immediately"
-            ),
+            "timing": (checker_timing if _roles.BY_ID[agent_id].kind == _roles.CHECKER
+                       else "starts immediately"),
         }
         for agent_id in agents
     ]

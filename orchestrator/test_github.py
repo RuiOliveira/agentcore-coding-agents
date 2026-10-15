@@ -275,6 +275,18 @@ def test_checkout_prints_the_finished_play_url_for_the_page_port(
     assert "not 8000 or 8001" in out and "workshop_urls.py <port>" in out
 
 
+def test_the_team_game_checkout_points_at_the_gallery_as_part_4_does(
+        monkeypatch, tmp_path, capsys):
+    """October 13 live walk: after part 4's checkout the hint told the room to ask Claude
+    Code to start the game on a free port, while the page publishes it to the gallery."""
+    _checkout_fixture(monkeypatch, tmp_path)
+    assert github._main(["checkout", str(tmp_path / "team-game")]) == 0
+    out = capsys.readouterr().out
+    assert "cd ~/team-game && npm install" in out, out
+    assert "gallery.py publish --project ~/team-game --port 8000 -- npm start" in out
+    assert "claude" not in out.split("Next:", 1)[1]
+
+
 def test_the_play_hint_never_changes_the_checkout_result(monkeypatch, tmp_path, capsys):
     """Advisory only: an unresolvable origin still names the path, and a hint that
     raises is swallowed. The checkout itself and its exit code are unchanged."""

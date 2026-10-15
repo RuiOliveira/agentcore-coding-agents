@@ -19,12 +19,25 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import progress  # noqa: E402
+import run_store  # noqa: E402
 
 ARN = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/claude_code-AbCdEf1234"
 
 
 class NotFound(Exception):
     response = {"Error": {"Code": "ResourceNotFoundException"}}
+
+
+class NoSuchEntity(Exception):
+    response = {"Error": {"Code": "NoSuchEntity"}}
+
+
+class ParameterNotFound(Exception):
+    response = {"Error": {"Code": "ParameterNotFound"}}
+
+
+class ImageNotFound(Exception):
+    response = {"Error": {"Code": "ImageNotFoundException"}}
 
 
 class FakeAws:
@@ -37,7 +50,38 @@ class FakeAws:
     def get_agent_runtime(self, agentRuntimeId):
         if self.box.runtime_status is None:
             raise NotFound()
-        return {"status": self.box.runtime_status}
+        return {"status": self.box.runtime_status,
+                "roleArn": "arn:aws:iam::123456789012:role/service-role/"
+                           "AmazonBedrockAgentCoreRuntimeDefaultServiceRole-abc12"}
+
+    # iam
+    def get_role_policy(self, RoleName, PolicyName):
+        if not self.box.grants:
+            raise NoSuchEntity()
+        return {"PolicyName": PolicyName}
+
+    def get_api_key_credential_provider(self, name):
+        if not self.box.kiro_key:
+            raise NotFound()
+        return {"name": name}
+
+    def get_paginator(self, name):
+        assert name == "list_agent_runtimes"
+        box = self.box
+
+        class Pages:
+            def paginate(self):
+                names = (["claude_code"] if box.console_runtime else []) + box.team_runtimes
+                runtimes = [{"agentRuntimeName": n, "agentRuntimeArn": ARN.rsplit("/", 1)[0] + "/" + n + "-x"}
+                            for n in names]
+                return [{"agentRuntimes": runtimes}]
+        return Pages()
+
+    # ecr
+    def describe_images(self, repositoryName, imageIds):
+        if not self.box.image:
+            raise ImageNotFound()
+        return {"imageDetails": [{"imageDigest": "sha256:" + "ab" * 32}]}
 
     def list_gateways(self, **_):
         return {"items": [{"name": "github-mcp-gateway"}] if self.box.gateway else []}
@@ -50,6 +94,8 @@ class FakeAws:
 
     # ssm
     def get_parameter(self, Name):
+        if not self.box.endpoint:
+            raise ParameterNotFound()
         return {"Parameter": {"Value": "https://abc123.execute-api.us-west-2.amazonaws.com/github"}}
 
     # logs
@@ -73,7 +119,14 @@ class Box:
             folder.mkdir(parents=True)
         self.mounted = False
         self.runtime_status = "READY"
-        self.gateway = self.secret = self.reviewed = False
+        self.gateway = self.secret = self.reviewed = self.kiro_key = self.console_runtime = False
+        self.image = False
+        self.endpoint = False
+        self.grants = False
+        self.runs: list[dict] = []
+        self.team_runtimes: list[str] = []
+        monkeypatch.setattr(run_store, "attach_reader_mirror", lambda: "")
+        monkeypatch.setattr(run_store, "recent", lambda runs_dir, limit=10: list(self.runs))
         for key, value in {"WORKSHOP_REPO_ROOT": self.repo, "WORKSHOP_CODING_AGENTS_DIR": self.agents,
                            "HOME": self.home, "WORKSHOP_S3FILES_DIR": self.mnt,
                            "AWS_REGION": "us-west-2"}.items():
@@ -96,11 +149,6 @@ class Box:
         (self.agents / "claude-code" / "runtime_config.json").write_text(json.dumps({"runtime_arn": ARN}))
         return self
 
-    def detached(self):
-        (self.home / ".agentcore").mkdir(exist_ok=True)
-        (self.home / ".agentcore" / "detached-claude-code").touch()
-        return self
-
     def lid(self):
         (self.mnt / "lid").mkdir(exist_ok=True)
         (self.mnt / "lid" / "index.html").write_text("<canvas></canvas>")
@@ -110,6 +158,16 @@ class Box:
         (self.mnt / "fleet").mkdir(exist_ok=True)
         (self.mnt / "fleet" / "fanout-summary.json").write_text(json.dumps(
             {"agents": agents, "passed_health": passed, "microvms": agents, "wall_s": 140}))
+        return self
+
+
+    def coordinator(self, roles=None):
+        project = self.repo / "CodingAgents" / "agentcore"
+        (project / ".cli").mkdir(parents=True, exist_ok=True)
+        env = [{"name": "WORKSHOP_ROLES", "value": roles}] if roles else []
+        (project / "agentcore.json").write_text(json.dumps({"runtimes": [{"envVars": env}]}))
+        (project / ".cli" / "deployed-state.json").write_text(json.dumps({"targets": {"default": {
+            "runtimeArn": ARN.replace("claude_code-AbCdEf1234", "CodingAgents_orchestrator-Zz9")}}}))
         return self
 
 
@@ -128,12 +186,39 @@ def test_a_fresh_box_waits_for_the_host_first(box):
     assert "facilitator" in step.note
 
 
-def test_a_ready_host_is_told_the_one_deploy_command(box):
+def test_a_ready_host_is_told_to_build_then_create_the_runtime(box):
     box.host()
     step = _next(box)
-    assert step.name == "Claude Code Runtime"
-    assert step.commands == progress.CMD_DEPLOY
-    assert step.commands[-1] == "./deploy-prebuilt.sh claude-code"
+    assert step.part == progress.PART1 and step.name == "Claude Code image"
+    assert step.commands == progress.CMD_BUILD
+    assert step.commands[-1] == "docker buildx bake claude-code --push"
+    box.image = True
+    step = _next(box)
+    assert step.name == "Claude Code Runtime" and not step.commands
+    assert "console" in step.note and "Create default role" in step.note
+
+
+def test_a_fresh_clone_is_told_to_record_the_stack_ids(box):
+    box.mounted = True
+    step = _next(box)
+    assert step.name == "Your clone's infra.config" and step.commands == progress.CMD_INFRA
+
+
+def test_get_in_is_the_host_and_the_clone_because_the_attendee_builds_the_image(box):
+    box.host()
+    checks = progress._run_all(progress.SPECS)
+    assert [c.name for c in checks if c.part == progress.GET_IN] == [
+        "Workshop host", "Your clone's infra.config"]
+    assert all(c.state == progress.DONE for c in checks if c.part == progress.GET_IN)
+    image = next(c for c in checks if c.name == "Claude Code image")
+    assert image.state == progress.TODO and "coding-agents-claude-code:latest" in image.detail
+
+
+def test_a_runtime_built_in_the_console_is_found_by_its_name(box):
+    box.host()
+    box.console_runtime = True
+    check = next(c for c in progress._run_all(progress.SPECS) if c.name == "Claude Code Runtime")
+    assert check.state == progress.DONE
 
 
 def test_a_recorded_runtime_that_is_gone_is_not_done(box):
@@ -144,17 +229,21 @@ def test_a_recorded_runtime_that_is_gone_is_not_done(box):
     assert runtime.state == progress.TODO and "no longer exists" in runtime.detail
 
 
-def test_the_walk_follows_the_three_parts_in_order(box):
+def test_the_walk_follows_the_four_parts_in_order(box):
     box.host().runtime()
-    assert _next(box).name == "Detach and come back"
-    box.detached()
+    box.image = True
     step = _next(box)
-    assert step.name == "The work it finished" and "./connect.sh --resume" in step.commands
+    assert step.name == "The work it finished" and progress.CMD_START[0] in step.commands
     box.lid()
     assert _next(box).commands == progress.CMD_FANOUT
     box.fanout(passed=7)
     assert _next(box).part == progress.PART2, "a partly green fan-out is not done"
     box.fanout()
+    step = _next(box)
+    assert step.name == "The review endpoint" and step.commands == progress.CMD_ENDPOINT
+    review = next(c for c in progress._run_all(progress.SPECS) if c.name == "An agent woke up")
+    assert review.state == progress.TODO, "a missing endpoint is a step to do, not unknown"
+    box.endpoint = True
     assert _next(box).commands == progress.CMD_GITHUB
     box.secret = True
     assert "not deployed" in next(c for c in progress._run_all(progress.SPECS)
@@ -163,8 +252,54 @@ def test_the_walk_follows_the_three_parts_in_order(box):
     step = _next(box)
     assert step.name == "An agent woke up" and "pull request" in step.note
     box.reviewed = True
+    step = _next(box)
+    # Part 4 opens with its prerequisite: the checker's key, before any image.
+    assert step.part == progress.PART4 and step.commands == progress.CMD_KIRO_KEY
+    assert "Set Up Your Kiro API Key" in step.note
+    box.kiro_key = True
+    step = _next(box)
+    assert step.part == progress.PART4 and step.commands == progress.CMD_TEAM_IMAGES
+    box.team_runtimes = ["codex"]
+    assert "kiro" in next(c for c in progress._run_all(progress.SPECS)
+                          if c.name == "Codex and the checker").detail
+    box.team_runtimes = ["codex", "kiro"]
+    step = _next(box)
+    assert step.commands == progress.CMD_COORDINATOR and "SKILL.md" in step.note
+    box.coordinator()
+    box.console_runtime = True
+    step = _next(box)
+    assert step.commands == progress.CMD_GRANTS, "the grants are step 5, during the deploy"
+    box.grants = True
+    step = _next(box)
+    assert step.name == "A team build" and progress.CMD_ASK[-1] in step.commands and "Creative direction" in progress.CMD_ASK[-1]
+    box.runs = [{"run_id": "run_1", "status": "running", "role_prs": [{"pr_url": "https://x/1"}]}]
+    assert _next(box).name == "A team build", "a build still running is not done"
+    box.runs[0]["status"] = "needs_human"
     assert _next(box) is None
-    assert "All three parts are done" in progress.render(progress._run_all(progress.SPECS))
+    assert "All four labs are done" in progress.render(progress._run_all(progress.SPECS))
+
+
+def test_a_coordinator_deployed_with_the_no_key_checker_needs_no_kiro_key(box):
+    box.coordinator(roles="claude-code,codex,claude-code-validator")
+    check = next(c for c in progress._run_all(progress.SPECS) if c.name == "The checker's key")
+    assert check.state == progress.DONE and "claude-code-validator" in check.detail
+
+
+def test_the_no_key_checker_is_looked_up_by_its_own_runtime_name(box):
+    box.coordinator(roles="claude-code,codex,claude-code-validator")
+    box.team_runtimes = ["codex", "kiro"]
+    check = next(c for c in progress._run_all(progress.SPECS) if c.name == "Codex and the checker")
+    assert check.state == progress.TODO and "claude_code_validator" in check.detail
+    box.team_runtimes = ["codex", "claude_code_validator"]
+    check = next(c for c in progress._run_all(progress.SPECS) if c.name == "Codex and the checker")
+    assert check.state == progress.DONE
+
+
+def test_every_build_next_step_names_its_registry_for_a_new_terminal():
+    for commands in (progress.CMD_BUILD, progress.CMD_TEAM_IMAGES):
+        assert any(line.startswith("export REGISTRY=") for line in commands)
+        assert commands.index(next(l for l in commands if l.startswith("export REGISTRY="))) < \
+            commands.index(next(l for l in commands if l.startswith("docker buildx bake")))
 
 
 def test_a_check_that_raises_is_unknown_and_never_hides_the_rest(box, monkeypatch):
@@ -184,7 +319,7 @@ def test_json_output_is_valid_and_carries_next(box, capsys):
     box.host()
     progress.main(["--json"])
     data = json.loads(capsys.readouterr().out)
-    assert data["next"]["name"] == "Claude Code Runtime"
+    assert data["next"]["name"] == "Claude Code image"
 
 
 def test_no_full_account_id_ever_reaches_the_output(box, capsys):

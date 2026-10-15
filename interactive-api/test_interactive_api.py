@@ -737,3 +737,18 @@ def test_live_claude_answers_from_inside_the_jailed_pty():
             break
     assert ok, f"claude did not answer from inside the jail: {text[-400:]!r}"
     ia.dispatch("DELETE", f"/api/sessions/{sid}", None)
+
+
+def test_a_console_created_runtime_shows_ready_by_its_name(monkeypatch):
+    """A Runtime made in the AgentCore console has no runtime_config.json; the shelf
+    finds it by name through the orchestrator's wiring, as Agents terminals do."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "orchestrator"))
+    import runtime_config
+    arn = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/claude_code-AbCdEf1234"
+    monkeypatch.setattr(runtime_config, "named_runtime",
+                        lambda role: arn if role == "claude-code" else "")
+    real = ia._real_runtime_for("claude-code")
+    assert real["runtime_arn"] == arn and real["region"] == "us-west-2"
+    assert real["runtime_id"] == "claude_code-AbCdEf1234"
+    assert ia._real_runtime_for("codex") is None

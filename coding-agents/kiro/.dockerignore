@@ -1,0 +1,9 @@
+# Local state and secrets never enter the build context (explicit COPY lines decide the image).
+runtime_config.json
+agent.config
+*.private.json
+*.pem
+*.local*
+__pycache__/
+*.pyc
+.deployed-state.json
