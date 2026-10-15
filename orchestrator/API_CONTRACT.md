@@ -190,9 +190,9 @@ Console renders these on the Stage 1 shelf.
 ```json
 {
   "agents": [
-    {"id": "claude-code",           "label": "Claude Code", "default_role": "backend-builder",   "model": "us.anthropic.claude-opus-5",               "credential": "bedrock-native"},
-    {"id": "codex",                 "label": "Codex",       "default_role": "frontend-builder",  "model": "us.openai.gpt-5.6-sol",                       "credential": "runtime-iam"},
-    {"id": "kiro",                  "label": "Kiro",        "default_role": "validator",         "model": "claude-opus-5",                              "credential": "api-key"}
+    {"id": "claude-code",           "label": "Claude Code", "default_role": "backend-builder",   "model": "global.anthropic.claude-sonnet-5",               "credential": "bedrock-native"},
+    {"id": "codex",                 "label": "Codex",       "default_role": "frontend-builder",  "model": "global.openai.gpt-5.6-sol",                       "credential": "runtime-iam"},
+    {"id": "kiro",                  "label": "Kiro",        "default_role": "validator",         "model": "claude-opus-5.5",                            "credential": "api-key"}
   ]
 }
 ```
@@ -204,6 +204,12 @@ Kiro's model is selected in its vendor namespace by `WORKSHOP_KIRO_MODEL` and
 passed with `--model`, separately from Bedrock model ids. Its `credential` is
 `api-key`: the attendee's own `ksk_`, fetched at session start
 from the AgentCore Identity Token Vault and never injected as a runtime environment variable.
+`WORKSHOP_KIRO_EFFORT` optionally selects `low`, `medium`, `high`, `xhigh`, or
+`max` on the pinned CLI. The Runtime deployer and coordinator both forward it;
+manual and dispatched sessions use the same setting. An absent value selects
+`medium`; an explicitly empty value omits `--effort`, retaining Kiro's own default.
+`/app/run.sh --effort VALUE`
+overrides the environment for that session.
 
 ### `POST /api/runs`: submit one task (fire-and-forget)
 Request:
@@ -260,7 +266,7 @@ Append-only audit trail of phase transitions and role activity (embedded event a
   sidebar can never advertise an agent this deployment does not run:
   `{ "roster": [ {"role":"claude-code","label":"Claude Code","kind":"builder",
   "capability":"backend","role_name":"backend-builder","description":"…",
-  "steering_file":"CLAUDE.md","model":"us.anthropic.claude-opus-5",
+  "steering_file":"CLAUDE.md","model":"global.anthropic.claude-sonnet-5",
   "credential":"bedrock-native"}, … ] }`.
 - **`GET /api/runs/{id}/terminals`**: per-role shell transcripts (every line a real
   `/bin/sh` command the role ran in its container, with output + exit code):

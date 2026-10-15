@@ -1,5 +1,5 @@
 # Codex runtime settings. Project instructions live in AGENTS.md.
-model = "us.openai.gpt-5.6-sol"
+model = "global.openai.gpt-5.6-sol"
 model_provider = "amazon-bedrock-runtime"
 model_reasoning_effort = "medium"
 check_for_update_on_startup = false
@@ -8,6 +8,7 @@ check_for_update_on_startup = false
 environment = "workshop"
 log_user_prompt = false
 exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/logs", protocol = "binary" } }
+metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/metrics", protocol = "binary" } }
 trace_exporter = "none"
 
 # entrypoint.sh writes the deployment region under

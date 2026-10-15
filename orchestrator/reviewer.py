@@ -33,15 +33,16 @@ and merges on its own.
 from __future__ import annotations
 
 import json
-import os
 import re
+import os
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+from gate_diagnostics import extract_failure_lines
+
 
 LGTM_TOKEN = "LGTM: no changes needed"   # the exact pass token, kept verbatim
 # One bounded re-implement pass, then a human. THE SINGLE SOURCE OF TRUTH for
@@ -49,33 +50,11 @@ LGTM_TOKEN = "LGTM: no changes needed"   # the exact pass token, kept verbatim
 # so editing this number actually changes behavior.
 MAX_REVIEW_ROUNDS = 1
 
-# New runs use a random 48-bit suffix so two coordinator sessions started in the
-# same second cannot share a branch or workspace. Keep the old form readable so
-# existing pull requests remain reviewable.
-_RUN_BRANCH = re.compile(
-    r"^run/(run_[0-9]{6}_(?:[0-9]{3}|[0-9a-f]{12}))$"
-)
-
-
-def branch_run_id(branch: str | None) -> str | None:
-    """Map a branch name back to the exact run that produced it, or None.
-
-    A strict branch-suffix guard: the engine always branches as
-    ``run/<run_id>`` and run ids match a strict pattern, so anything else,
-    including SQL-LIKE-wildcard or lookalike branches, refuses to match rather
-    than falling back to a most-recent heuristic.
-    """
-    if not branch:
-        return None
-    m = _RUN_BRANCH.match(branch)
-    return m.group(1) if m else None
-
-
 @dataclass
 class Verdict:
     """The judge's structured output for one round."""
 
-    state: str = "in_review"        # in_review | approved | changes_requested
+    state: str = "in_review"        # in_review | approved | changes_requested | unavailable
     gate: dict | None = None        # the acceptance-gate result (real execution)
     assessment: str = ""            # the Assessment markdown posted on the PR
     reasons: list[str] = field(default_factory=list)  # feedback for the loop
@@ -107,6 +86,20 @@ GATE_TIMEOUT_S = max(180, int(os.environ.get("WORKSHOP_GATE_BUDGET_S") or 240))
 # purpose: this runs on the verdict path, and a wedged reap must not hold up the run.
 _GROUP_REAP_S = 5
 
+
+
+def _decode_literal_newlines(text: str) -> str:
+    """Undo a model's double-escaped line breaks so a lens renders as Markdown.
+
+    A September 29 review arrived with literal backslash-n sequences between its
+    bullets, which GitHub then showed as text. A literal one becomes a line break
+    when it starts a list item, or anywhere when the lens has no real line break.
+    """
+    if "\\n" not in text:
+        return text
+    if "\n" not in text:
+        return text.replace("\\n", "\n")
+    return re.sub(r"\\n(?=\s*[-*] )", "\n", text)
 
 def _kill_process_group(pgid: int | None) -> None:
     """Tear down the check's whole process group (SIGTERM, then SIGKILL).
@@ -197,6 +190,21 @@ def _summary_line(out: str, code: int) -> str:
     return lines[-1].strip() or f"exit {code}"
 
 
+# What an authored check inherits from the process that runs it. The check is model-written
+# code, and this process may hold credentials that can merge a pull request (the
+# coordinator's role reaches the GitHub tools), so it gets an allowlist of ordinary
+# variables and none of AWS's, GitHub's, or the engine's. It still runs on this host:
+# this keeps credentials out of its environment, it does not make it a sandbox.
+_CHECK_ENV_NAMES = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "TMPDIR", "TERM",
+                    "LD_LIBRARY_PATH", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+                    "REQUESTS_CA_BUNDLE", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "no_proxy"}
+
+
+def _check_environment() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k in _CHECK_ENV_NAMES or k.startswith("LC_")}
+
+
 def run_gate(check_path: str, work_dir: str, task: str, url: str = "") -> dict:
     """The acceptance gate: run the check the VALIDATOR ROLE authored, read its
     real exit code. That is the whole gate.
@@ -248,7 +256,7 @@ def run_gate(check_path: str, work_dir: str, task: str, url: str = "") -> dict:
     # budgeted 15-30s while the deliverable was still preparing declared
     # dependencies. Those were red gates on working services, which is the one
     # failure this file must not manufacture.
-    env = {**os.environ,
+    env = {**_check_environment(),
            "WORKSHOP_WORK_DIR": work_dir,
            "WORKSHOP_TASK": task or "",
            "WORKSHOP_GATE_TIMEOUT_S": str(GATE_TIMEOUT_S),
@@ -312,20 +320,46 @@ def run_gate(check_path: str, work_dir: str, task: str, url: str = "") -> dict:
                                f"the validator's authored check FAILED (exit {code}): "
                                f"{summary}")}],
         "summary": summary,
+        # Extract before shortening output: later PASS lines can hide an early
+        # failure from both the repair prompt and the pull request.
+        "failure_lines": extract_failure_lines(out) if code != 0 else [],
         "output": (out or "")[-4000:]}
 
 
 # ----------------------------------------------------- integrated read-only review
-# At an event the backend model is the strongest Bedrock-native model known to be
-# enabled, so use it unless the operator explicitly picks a cheaper review model.
+# The stack sets WORKSHOP_REVIEW_MODEL (ReviewModelId, Opus 5 by default); without
+# it the review follows the backend model, then Sonnet 5.
 # The reviewer is independent from every builder conversation, but it evaluates both
 # required lenses in one turn to avoid paying twice for the same candidate context.
 _REVIEW_MODEL = (
     os.environ.get("WORKSHOP_REVIEW_MODEL")
     or os.environ.get("WORKSHOP_CLAUDE_MODEL")
-    or "claude-sonnet-4-6"
+    or "global.anthropic.claude-sonnet-5"
 )
 INTEGRATED_REVIEW_MODEL = _REVIEW_MODEL
+# Claude 5 models reason before they answer: a 3,200-token cap ended Opus 5's reply
+# before its verdict on 2026-09-23. The verdict now arrives through a tool schema, so
+# a long answer cannot break its own JSON, and low effort keeps a review near
+# twenty seconds (Opus 5: 20-23 s over three game builds on 2026-09-27).
+_REVIEW_MAX_TOKENS = int(os.environ.get("WORKSHOP_REVIEW_MAX_TOKENS", "16000"))
+_REVIEW_EFFORT = os.environ.get("WORKSHOP_REVIEW_EFFORT", "low").strip()
+_REVIEW_TOOL = {"toolSpec": {
+    "name": "submit_review",
+    "description": "Submit the complete integrated review verdict for this pull request.",
+    "inputSchema": {"json": {
+        "type": "object",
+        "required": ["approve", "reasons", "work_item_evidence",
+                     "adversarial_assessment", "design_assessment"],
+        "properties": {
+            "approve": {"type": "boolean"},
+            "reasons": {"type": "array", "items": {"type": "string"}},
+            "work_item_evidence": {"type": "object",
+                                   "additionalProperties": {"type": "string"}},
+            "adversarial_assessment": {"type": "string"},
+            "design_assessment": {"type": "string"},
+        },
+    }},
+}}
 
 _REVIEW_RESPONSE_CONTRACT = (
     "Reply with STRICT JSON only:\n"
@@ -440,8 +474,8 @@ def _parse_judge_response(text: str, required_work_ids: list[str]) -> dict:
             + ", ".join(missing)
         )
 
-    adversarial = str(parsed.get("adversarial_assessment") or "").strip()
-    design = str(parsed.get("design_assessment") or "").strip()
+    adversarial = _decode_literal_newlines(str(parsed.get("adversarial_assessment") or "").strip())
+    design = _decode_literal_newlines(str(parsed.get("design_assessment") or "").strip())
     missing_lenses = [
         label for label, value in (
             ("adversarial_assessment", adversarial),
@@ -536,7 +570,9 @@ def _run_review_turn(
                 )
         try:
             out = llm_module.invoke(
-                model, prompt, system=_INTEGRATED_REVIEW_SYSTEM, max_tokens=3200)
+                model, prompt + "\n\nSubmit the verdict by calling the submit_review tool once.",
+                system=_INTEGRATED_REVIEW_SYSTEM, max_tokens=_REVIEW_MAX_TOKENS,
+                tool=_REVIEW_TOOL, effort=_REVIEW_EFFORT)
         except Exception as exc:  # noqa: BLE001 (record the model boundary)
             prior_error = f"model invocation unavailable ({type(exc).__name__})"
             if not attempt:
@@ -637,7 +673,10 @@ def _combine_review(
         f"Model: `{record.get('model') or 'unavailable'}`\n\n"
         "</details>"
     )
-    state = "Approve" if approve else "Request changes"
+    # A review that never produced a decision requests nothing: headlining it
+    # "Request changes" on the PR contradicted the run's own advice not to rebuild.
+    state = ("Approve" if approve else
+             "Review unavailable (no decision)" if unavailable else "Request changes")
     return {
         "approve": approve,
         "reasons": reasons,
@@ -679,7 +718,8 @@ def _default_judge(run: Any, gate: dict, subject: Any = None) -> dict | None:
             INTEGRATED_REVIEW_MODEL, note="no model credentials available")
         return _combine_review(gate, record, None)
 
-    parts: list[str] = [f"Task: {getattr(run, 'task', '')!r}",
+    # The request as the builders read it, not a Python repr with escaped newlines.
+    parts: list[str] = [f"Task:\n{getattr(run, 'task', '') or ''}",
                         f"acceptance gate passed: {gate.get('passed')}",
                         f"gate: {json.dumps(gate.get('checks', []))[:2000]}"]
     if subject is not None:
@@ -883,7 +923,8 @@ def assess(run: Any, gate: dict, round_no: int,
         verdict.review_unavailable = bool(jv.get("review_unavailable"))
         verdict.assessment = (jv.get("assessment")
                               or _abstained_assessment(gate, verdict.lgtm))
-    verdict.state = "approved" if verdict.lgtm else "changes_requested"
+    verdict.state = ("approved" if verdict.lgtm else
+                     "unavailable" if verdict.review_unavailable else "changes_requested")
     if verdict.lgtm and LGTM_TOKEN not in verdict.assessment:
         # Approval is a literal, checkable token, never a paraphrase.
         verdict.assessment = verdict.assessment.rstrip() + f"\n\n{LGTM_TOKEN}\n"

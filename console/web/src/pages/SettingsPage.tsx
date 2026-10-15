@@ -33,7 +33,23 @@ import { recordSettingsError, settingsErrorMessage, type SettingsError, type Set
 
 const roleName = (role: string) => role === 'orchestrator' ? 'Coordinator' : agentInstanceLabel(role);
 type Connection = { role: string; arn: string; source: RuntimeSource; description?: string };
-const sourceName = (source: RuntimeSource) => ({ settings: 'Console settings', environment: 'Environment', deployed: 'Deployment' })[source] || source;
+const sourceName = (source: RuntimeSource) => ({ settings: 'Console settings', environment: 'Environment', deployed: 'Deployment', named: 'Runtime name' })[source] || source;
+
+function SettingsModalFooter({ busy, expired, disabled, cancel, action, text }: {
+  busy: boolean; expired: boolean; disabled: boolean;
+  cancel: () => void; action: () => void; text: string;
+}) {
+  const actions = useRef<HTMLDivElement>(null);
+  // Recovery removes its focused button. Move focus before that update to a
+  // stable, non-actionable target inside this modal; never activate Save/Cancel.
+  return <Box float="right"><div ref={actions} tabIndex={-1} role="group" aria-label="Dialog actions">
+    <SpaceBetween direction="horizontal" size="xs">
+      <Button variant="link" disabled={busy} onClick={cancel}>Cancel</Button>
+      {expired && <SessionRecoveryActions beforeCheck={() => actions.current?.focus({ preventScroll: true })} />}
+      <Button variant="primary" loading={busy} disabled={disabled || expired} onClick={action}>{text}</Button>
+    </SpaceBetween>
+  </div></Box>;
+}
 
 function SettingsModalFooter({ busy, expired, disabled, cancel, action, text }: {
   busy: boolean; expired: boolean; disabled: boolean;
@@ -233,7 +249,7 @@ export function SettingsPage() {
             { id: 'description', header: 'Description', minWidth: 340, cell: row => <SpaceBetween size="xs"><Box>{row.description || 'No description'}</Box>
               <Link variant="secondary" onFollow={() => { setEdit(row); setDescription(row.description || ''); report('description'); }}>Edit description</Link></SpaceBetween> },
             { id: 'actions', header: 'Actions', minWidth: 150, cell: row => row.source === 'settings' ? <Button disabled={auth.expired} onClick={() => { setRemove(row); report('remove'); }}>Remove</Button>
-              : <Box color="text-body-secondary">Managed by {row.source === 'environment' ? 'environment' : 'deployment'}</Box> },
+              : <Box color="text-body-secondary">Managed by {row.source === 'environment' ? 'environment' : row.source === 'named' ? 'the AgentCore console' : 'deployment'}</Box> },
           ]} />
       </SpaceBetween> },
       { id: 'kiro', label: 'Kiro access', content: <Container header={<Header variant="h2"

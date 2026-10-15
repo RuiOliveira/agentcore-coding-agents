@@ -1,4 +1,5 @@
-ARG WORKSHOP_RUNTIME_BASE_IMAGE
+# Built with named contexts: docker buildx bake <role>, from the repository root (docker-bake.hcl).
+ARG WORKSHOP_RUNTIME_BASE_IMAGE=public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:06da5a3362eda00c5114227ac81abe56dd9b943395553b7c64a310457f4d9e2b
 FROM ${WORKSHOP_RUNTIME_BASE_IMAGE}
 
 RUN dnf install -y --allowerasing \
@@ -28,12 +29,12 @@ RUN useradd -m -d /home/agent -u 1000 agent && \
     git config --global user.name "AgentCore Bot" && \
     git config --global user.email "agentcore@example.com"
 
-COPY _toolchain/ /opt/workshop-cli/
+COPY --from=toolchain cli-versions.json cli_versions.py /opt/workshop-cli/
 RUN python3 /opt/workshop-cli/cli_versions.py install --cli claude-code \
       --home /home/agent --user agent --receipt /opt/workshop-cli/installed.json
 
 COPY --chown=agent:agent CLAUDE.md /home/agent/CLAUDE.md
-COPY --chown=agent:agent healthcheck.py /app/healthcheck.py
+COPY --chown=agent:agent --from=toolchain healthcheck.py /app/healthcheck.py
 COPY run.sh /app/run.sh
 COPY entrypoint.sh /app/entrypoint.sh
 COPY otel-collector-config.yaml /app/otel-collector-config.yaml
@@ -58,4 +59,5 @@ USER agent
 
 # entrypoint.sh starts the OTel collector at boot, then exec's the CMD.
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["python3", "/app/healthcheck.py"]
+# /ping: HealthyBusy while the agent CLI runs, so a detached session keeps working.
+CMD ["python3", "/app/healthcheck.py", "--agent", "claude-code-validator", "--busy", "claude", "--busy", "claude-code"]

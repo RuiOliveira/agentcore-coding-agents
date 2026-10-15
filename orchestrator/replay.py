@@ -34,9 +34,15 @@ instead of rewriting history.
 
 from __future__ import annotations
 
-import json
 import os
+import re
 from typing import Any
+
+from gate_diagnostics import (
+    MAX_FAILURE_LINES,
+    MAX_FAILURE_LINE_CHARS,
+    gate_failure_lines,
+)
 
 # Cap the check excerpt. The whole point is to show a reviewer WHAT was asserted
 # without pasting a file that already ships in the diff beside it.
@@ -227,7 +233,7 @@ def work_item_narrative(run: Any, item: Any) -> str:
         "",
         "## Request",
         "",
-        "> " + str(getattr(run, "task", "") or "").replace("\n", "\n> "),
+        _request_block(str(getattr(run, "task", "") or ""), str(getattr(run, "run_id", "") or "")),
         "",
         "## Shared Plan",
         "",
@@ -256,9 +262,10 @@ def work_item_narrative(run: Any, item: Any) -> str:
         "",
         "The role worked in its own checkout, and this pull request is judged on "
         "its own. The validator's executed check and one independent review run "
-        f"against `{item.base_branch}` as it stands plus this diff, and this pull "
-        "request merges on its own; a sibling role's pull request is checked, "
-        "reviewed, and merged separately. This body is written once, so that "
+        f"against `{item.base_branch}` as it stands plus this diff. A person merges "
+        "it after reading that evidence (unless the engine was set to merge approved "
+        "pull requests); a sibling role's pull request is checked, reviewed, and "
+        "merged separately. This body is written once, so that "
         "evidence arrives as comments on this timeline.",
         "",
         f"<sub>run `{getattr(run, 'run_id', '')}` · work `{item.work_id}`</sub>",
@@ -317,6 +324,19 @@ def gate_evidence_comment(
         "The validator wrote this check for this pull request. The orchestrator ran "
         "it and used its exit code.",
     ]
+    failures = gate_failure_lines(gate)
+    if failures:
+        lines += [
+            "",
+            "<details><summary>Failure diagnostics "
+            f"(first up to {MAX_FAILURE_LINES} matching lines, "
+            f"up to {MAX_FAILURE_LINE_CHARS} characters per line)</summary>",
+            "",
+            # Indented code preserves the wording even if it contains backticks.
+            *("    " + line for line in failures),
+            "",
+            "</details>",
+        ]
     reported = _gate_output_excerpt(gate)
     if reported:
         body, shown, total = reported
@@ -337,19 +357,43 @@ def gate_evidence_comment(
         ]
     if assessment:
         lines += ["", assessment.strip()]
-    return "\n".join(lines).rstrip() + "\n"
+    body = "\n".join(lines).rstrip() + "\n"
+    if len(body) > _GATE_COMMENT_MAX_CHARS:
+        marker = (
+            f"\n\n[Comment truncated at {_GATE_COMMENT_MAX_CHARS:,} characters.]\n"
+        )
+        return body[:_GATE_COMMENT_MAX_CHARS - len(marker)] + marker
+    return body
 
 
-# A red gate has to say WHY on the pull request itself. The engine keeps the check's
-# real stdout in gate["output"], and a reviewer arriving from a GitHub notification
-# can reach neither the engine log nor the coordinator session, so a comment that
-# shows only the check's SOURCE and "see the failing checks" names evidence the reader
-# cannot see. A live run made exactly that comment: 43 of 45 assertions passed and the
-# two that failed were nowhere on the PR. The tail is the useful end (per-check lines,
-# then the RESULT and the failed-check list), and it stays bounded because the source
-# excerpt is already in the same comment.
+# The output tail supplies context alongside the separately saved failure lines.
+# A tail alone can contain only PASS lines even when the executable exited nonzero.
 _GATE_OUTPUT_TAIL_LINES = 40
 _GATE_OUTPUT_MAX_CHARS = 3000
+_REQUEST_MAX_CHARS = 20_000
+
+
+def _request_block(task: str, run_id: str = "") -> str:
+    """The participant's words as literal text on GitHub, and bounded.
+
+    Quoted as Markdown, a `<canvas>` in the request vanished, a `---` line turned
+    the text above it into a heading, and `@name` notified a stranger; uncapped, an
+    admitted 64 KiB request pushed the PR body past GitHub's limit, which then read
+    as a GitHub permission failure. A fence longer than any backtick run in the text
+    keeps every character literal.
+    """
+    text = task or "(no task recorded)"
+    note = ""
+    if len(text) > _REQUEST_MAX_CHARS:
+        text = text[:_REQUEST_MAX_CHARS]
+        note = (f"\n\n*(Shortened here to {_REQUEST_MAX_CHARS:,} characters; the full request "
+                f"is recorded with run `{run_id}`.)*")
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{text}\n{fence}{note}"
+
+
+_GATE_COMMENT_MAX_CHARS = 20_000
 
 
 def _gate_output_excerpt(gate: dict[str, Any]) -> tuple[str, int, int] | None:
@@ -385,7 +429,7 @@ def narrative(run: Any) -> str:
     #    and paraphrasing them here would be the engine pretending to understand
     #    the request.
     parts.append("## What was requested\n")
-    parts.append("> " + (task.replace("\n", "\n> ") if task else "(no task recorded)"))
+    parts.append(_request_block(task, str(getattr(run, "run_id", "") or "")))
 
     # 2. Who did it. The roster is not fixed (WORKSHOP_ROLES selects it), so this
     #    is generated from the roles that ran, never from a literal.
@@ -513,17 +557,3 @@ def round_comment(run: Any) -> str:
                  f"{'passed' if gate.get('passed') else 'did not pass'}"
                  + (f": `{summary}`" if summary else "") + ".")
     return "\n".join(lines) + "\n"
-
-
-def as_json(run: Any) -> str:
-    """The same facts as data, for the diagnostic bundle. Never used on the PR."""
-    return json.dumps({
-        "run_id": getattr(run, "run_id", ""),
-        "task": getattr(run, "task", ""),
-        "status": getattr(run, "status", ""),
-        "iterations": getattr(run, "iterations", 0),
-        "roles": _role_rows(run),
-        "gate": {"passed": bool((getattr(run, "gate", None) or {}).get("passed")),
-                 "summary": (getattr(run, "gate", None) or {}).get("summary", "")},
-        "pr_url": getattr(run, "pr_url", None),
-    }, indent=2)

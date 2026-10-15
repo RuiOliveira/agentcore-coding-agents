@@ -387,37 +387,6 @@ def install_cli(name, *, home=None, prefix=None, owner=None, manifest=None):
     return receipt
 
 
-def _copy_tracked_tree(source, destination):
-    """Copy only this public tree's tracked files, never adjacent run/config data."""
-    source, destination = Path(source).resolve(), Path(destination)
-    files = subprocess.check_output(
-        ["git", "-C", str(source), "ls-files", "-z", "--", "."]
-    ).decode().split("\0")
-    for name in filter(None, files):
-        path = source / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("Build inputs must be ordinary tracked files: " + str(path))
-        target = destination / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
-
-
-def stage_context(source, destination, manifest_path=None):
-    source, destination = Path(source).resolve(), Path(destination).resolve()
-    if destination.exists():
-        raise ValueError("Build staging destination must not already exist")
-    destination.mkdir(parents=True)
-    _copy_tracked_tree(source, destination)
-    tools = destination / "_toolchain"
-    tools.mkdir()
-    shutil.copy2(manifest_path or MANIFEST_PATH, tools / MANIFEST_PATH.name)
-    shutil.copy2(__file__, tools / Path(__file__).name)
-    if source.name == "claude-code":
-        skill = source.parents[1] / "harness-skills/skills/backend-engineering"
-        _copy_tracked_tree(skill, destination / "skills/backend-engineering")
-    return {"manifest_sha256": manifest_sha256(manifest_path), "context": str(destination)}
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path)
@@ -428,9 +397,6 @@ def main(argv=None):
     get.add_argument("key")
     spec = sub.add_parser("npm-spec")
     spec.add_argument("name")
-    stage = sub.add_parser("stage-context")
-    stage.add_argument("--source", type=Path, required=True)
-    stage.add_argument("--destination", type=Path, required=True)
     for action in ("install", "verify", "configure"):
         child = sub.add_parser(action)
         child.add_argument("--cli", required=True)
@@ -464,8 +430,6 @@ def main(argv=None):
         return 0
     if args.action == "check-sdk":
         result = require_deploy_sdk(data)
-    elif args.action == "stage-context":
-        result = stage_context(args.source, args.destination, args.manifest)
     elif args.action == "install-host":
         user = pwd.getpwnam(args.user)
         owner = (user.pw_uid, user.pw_gid)

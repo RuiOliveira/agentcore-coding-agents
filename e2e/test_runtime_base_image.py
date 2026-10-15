@@ -1,5 +1,4 @@
 """Keep every selected Runtime base consistent with the canonical toolchain."""
-import importlib.util
 import json
 from pathlib import Path
 import re
@@ -23,36 +22,47 @@ def runtime_base(dockerfile):
 
 
 @pytest.mark.parametrize("role", ROLES)
-def test_role_base_is_supplied_by_the_shared_builder(role):
+def test_role_base_defaults_to_the_manifest_pin_and_builds_from_named_contexts(role):
     folder = ROOT / "coding-agents" / role
+    dockerfile = (folder / "Dockerfile").read_text()
+    expected = json.loads(PINS.read_text())["runtime"]["base_image"]
     assert runtime_base(folder / "Dockerfile") == "${WORKSHOP_RUNTIME_BASE_IMAGE}"
-    assert (folder / "Dockerfile").read_text().splitlines()[0] == "ARG WORKSHOP_RUNTIME_BASE_IMAGE"
+    assert f"ARG WORKSHOP_RUNTIME_BASE_IMAGE={expected}" in dockerfile.splitlines()
+    assert "COPY --from=toolchain cli-versions.json cli_versions.py /opt/workshop-cli/" in dockerfile
+    assert "_toolchain" not in dockerfile
     setup = (folder / "setup.sh").read_text().replace("\\\n", "")
     calls = re.findall(r"^\s*build_and_push_arm64[^\n]+", setup, re.MULTILINE)
-    assert len(calls) == 1
-    assert calls[0].rstrip().endswith("--toolchain")
-    # test_cli_versions executes this real shared helper through Docker and Finch,
-    # and verifies that its build argument equals the manifest's base_image.
+    assert len(calls) == 1 and calls[0].rstrip().endswith("--toolchain")
 
 
 @pytest.mark.parametrize("role", ROLES)
-def test_role_context_contains_the_canonical_toolchain_and_all_copy_inputs(role, tmp_path):
-    spec = importlib.util.spec_from_file_location(
-        "context_toolchain", ROOT / "coding-agents/cli_versions.py")
-    toolchain = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(toolchain)
-    target = tmp_path / role
-    toolchain.stage_context(ROOT / "coding-agents" / role, target)
-    assert (target / "_toolchain/cli-versions.json").read_bytes() == PINS.read_bytes()
-    assert (target / "_toolchain/cli_versions.py").read_bytes() == (
-        ROOT / "coding-agents/cli_versions.py").read_bytes()
-    paths = [str(path.relative_to(target)) for path in target.rglob("*") if path.is_file()]
-    assert not any(path.endswith("agent.config") or "private.json" in path for path in paths)
-    for line in (target / "Dockerfile").read_text().splitlines():
-        if line.startswith("COPY "):
-            words = [word for word in shlex.split(line)[1:] if not word.startswith("--")]
-            for source in words[:-1]:
-                assert list(target.glob(source)), f"{role}: COPY input missing: {source}"
+def test_every_copy_input_exists_and_local_state_stays_out_of_the_context(role):
+    folder = ROOT / "coding-agents" / role
+    contexts = {"toolchain": ROOT / "coding-agents", "skills": ROOT / "harness-skills/skills"}
+    for line in (folder / "Dockerfile").read_text().splitlines():
+        if not line.startswith("COPY "):
+            continue
+        words = shlex.split(line)[1:]
+        source_root = folder
+        for word in words:
+            if word.startswith("--from="):
+                source_root = contexts[word.split("=", 1)[1]]
+        for source in [w for w in words if not w.startswith("--")][:-1]:
+            assert list(source_root.glob(source)), f"{role}: COPY input missing: {source}"
+    ignored = (folder / ".dockerignore").read_text().split()
+    for pattern in ("runtime_config.json", "agent.config", "*.private.json", "*.pem"):
+        assert pattern in ignored, f"{role}/.dockerignore must exclude {pattern}"
+
+
+def test_the_bake_file_builds_every_role_with_the_same_pin_and_contexts():
+    bake = (ROOT / "docker-bake.hcl").read_text()
+    expected = json.loads(PINS.read_text())["runtime"]["base_image"]
+    assert f'default = "{expected}"' in bake
+    assert 'contexts  = { toolchain = "coding-agents", skills = "harness-skills/skills" }' in bake
+    assert 'platforms = ["linux/arm64"]' in bake
+    for role in ROLES:
+        assert f'target "{role}"' in bake and f'context  = "coding-agents/{role}"' in bake
+        assert f'"${{REGISTRY}}/coding-agents-{role}:latest"' in bake
 
 
 @pytest.mark.parametrize("path", (

@@ -341,7 +341,9 @@ def test_a_direction_cannot_silently_replace_an_unrelated_custom_task(tmp_path, 
     result = json.loads(_call(
         "run_build", task="an existing custom request", preset="game-from-scratch",
         creative_direction="a different direction"))
-    assert result["error"] == "AMBIGUOUS_PRESET_DIRECTION"
+    # Refused either way: the participant never named the preset (the model's task
+    # argument is ignored, so it cannot make the direction "ambiguous" on its own).
+    assert result["error"] in ("AMBIGUOUS_PRESET_DIRECTION", "PRESET_NOT_REQUESTED")
 
 
 def test_run_build_accepts_any_request_at_all(tmp_path, monkeypatch):
@@ -370,7 +372,7 @@ def test_available_models_comes_from_the_real_bedrock_catalog():
     cat = chat.available_models()
     ids = {m["id"] for m in cat["models"]}
     # ids are full Bedrock ids resolved from llm.BEDROCK_MODEL_MAP, not aliases
-    assert "us.anthropic.claude-sonnet-4-6" in ids
+    assert "global.anthropic.claude-sonnet-5" in ids
     assert all(m.get("label") for m in cat["models"])      # every entry is labelled
     assert cat["default"] == chat.DEFAULT_MODEL_ID
     assert cat["default"] in ids
@@ -493,3 +495,18 @@ def test_stream_chat_emits_keepalives_while_the_model_is_silent(monkeypatch):
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_a_team_build_under_auto_merge_reports_the_checker_starting_early(monkeypatch):
+    """October 13: the coordinator told the room the checker waits for both builders
+    while the watcher showed it start on the service under auto merge."""
+    builders = roles.builder_ids()
+    assert len(builders) >= 2, "the served roster has two builders"
+    agents = [*builders[:2], *roles.checker_ids()]
+    monkeypatch.setenv("WORKSHOP_MERGE_POLICY", "auto")
+    timing = {row["agent"]: row["timing"] for row in chat._schedule(agents)}
+    assert all("as soon as each builder's pull request can be judged" in timing[c]
+               for c in roles.checker_ids())
+    monkeypatch.setenv("WORKSHOP_MERGE_POLICY", "human_review")
+    assert all(row["timing"] == "after every selected builder finishes"
+               for row in chat._schedule(agents) if row["kind"] == roles.CHECKER)

@@ -25,6 +25,14 @@ it never reposts a registration form. The saved callback window expires one hour
 after setup began. Once the App id and key are saved, --resume skips conversion and
 waits for installation instead (also at most ten minutes).
 
+If you never reached GitHub's 'Create GitHub App' button (the tab was closed, or
+GITHUB_REPO changed before creation), `--restart` sets that unfinished setup aside and
+prints a new setup URL. It refuses once an App was created and its key saved. If GitHub
+rejects the manifest with "Public cannot be private", add `--public`.
+
+GITHUB_REPO accepts owner/repository; a pasted https://github.com/ URL, a trailing
+.git, or a trailing slash is normalized, and an email or a missing owner is explained.
+
 If an exchange's outcome is uncertain, its code is not retried. Recover the EXISTING
 App and its private key in GitHub settings, then use --app-id ID --key-file PATH.
 This is also the path for an older helper that left no saved checkpoint.
@@ -167,6 +175,31 @@ def setup_lock():
         os.close(fd)
 
 
+_REPO_SHAPE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def normalize_repo(value: str | None) -> str:
+    """owner/name from what attendees actually paste: a URL, a trailing .git or slash."""
+    repo = (value or "").strip()
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:", "github.com/"):
+        if repo.lower().startswith(prefix):
+            repo = repo[len(prefix):]
+            break
+    repo = repo.rstrip("/")
+    return repo[:-4] if repo.lower().endswith(".git") else repo
+
+
+def repo_problem(value: str) -> str:
+    """Say which part of owner/repository is wrong, with the fix."""
+    example = "for example: export GITHUB_REPO=\"octocat/my-agent-project\""
+    if "@" in value.split("/")[0]:
+        return f"GITHUB_REPO must start with your GitHub username, not an email address ({example})."
+    if "/" not in value:
+        return (f"GITHUB_REPO needs your GitHub username too: '{value}' should be "
+                f"'your-username/{value}' ({example}).")
+    return f"GITHUB_REPO must look like owner/repository, not '{value}' ({example})."
+
+
 def normalized_base_url(value: str) -> str:
     if not isinstance(value, str) or value != value.strip():
         raise SetupError("The workshop base URL must be an HTTPS origin.")
@@ -199,14 +232,20 @@ class SetupSession:
         atomic_private_write(self.path, (json.dumps(self.data, indent=2) + "\n").encode())
 
     @classmethod
-    def create(cls, base_url: str, port: int, repo: str, key_path: Path):
+    def create(cls, base_url: str, port: int, repo: str, key_path: Path, public: bool = False,
+               organization: str | None = None):
         if STATE_FILE.exists() or STATE_FILE.is_symlink():
-            raise SetupError("A saved App setup exists. Use --resume; do not create another App.")
+            saved = saved_summary()
+            raise SetupError(
+                f"A saved App setup exists{saved}. Continue it with --resume; do not create "
+                "another App. If you never chose 'Create GitHub App' on GitHub (no such App "
+                "under GitHub Settings > Developer settings > GitHub Apps), start over with --restart.")
         if key_path.exists() or key_path.is_symlink():
             raise SetupError("A key already exists. Finish its App with --app-id and --key-file.")
         now = time.time()
         name = f"AgentCore GitHub MCP {secrets.token_hex(3)}"
-        manifest = build_manifest(base_url, port, name)
+        webhook_url = resolve_webhook_url()
+        manifest = build_manifest(base_url, port, name, public, webhook_url)
         session = cls(STATE_FILE, {
             "version": 1, "phase": "awaiting_callback",
             "state": secrets.token_urlsafe(24), "name": name,
@@ -214,6 +253,7 @@ class SetupSession:
             "key_file": str(key_path), "checkout": str(REPO_ROOT.resolve()),
             "created_at": now, "expires_at": now + MANIFEST_LIFETIME_S,
             "manifest": manifest, "manifest_sha256": manifest_digest(manifest),
+            "public": public, "organization": organization, "webhook_url": webhook_url,
         })
         session.save()
         return session
@@ -231,7 +271,16 @@ class SetupSession:
                 and type(data["port"]) is int and 1 <= data["port"] <= 65535
                 and bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", data["repo"]))
                 and Path(data["key_file"]).is_absolute()
-                and data["manifest"] == build_manifest(data["base_url"], data["port"], data["name"])
+                and type(data.get("public", False)) is bool
+                and (data.get("organization") is None or bool(
+                    isinstance(data["organization"], str)
+                    and re.fullmatch(r"[A-Za-z0-9-]+", data["organization"])))
+                and (data.get("webhook_url") is None or bool(
+                    isinstance(data["webhook_url"], str)
+                    and data["webhook_url"].startswith("https://")))
+                and data["manifest"] == build_manifest(data["base_url"], data["port"], data["name"],
+                                                       data.get("public", False),
+                                                       data.get("webhook_url"))
                 and manifest_digest(data["manifest"]) == data["manifest_sha256"]
                 and all(type(data[key]) in (int, float) and math.isfinite(data[key])
                         for key in ("created_at", "expires_at"))
@@ -261,7 +310,12 @@ class SetupSession:
                 or (repo is not None and repo != self.data["repo"])
                 or (port is not None and port != self.data["port"])
                 or (key_path is not None and str(key_path) != self.data["key_file"])):
-            raise SetupError("Saved setup belongs to a different host, repository, port, or key path.")
+            raise SetupError(
+                "Saved setup belongs to a different host, repository, port, or key path: it "
+                f"was started for {self.data['repo']}. To continue it, export "
+                f"GITHUB_REPO={self.data['repo']} and use "
+                f"--resume. If App '{self.data['name']}' was never created on GitHub, start "
+                "over with --restart.")
 
     def check_waiting(self) -> None:
         if self.data["phase"] != "awaiting_callback":
@@ -283,7 +337,7 @@ class SetupSession:
         if hashlib.sha256(pem.encode()).hexdigest() != self.data["key_sha256"]:
             raise SetupError("Saved key evidence changed; no file was overwritten.")
         atomic_private_write(key_path, pem.encode(), replace=False)
-        return {**app, "pem": pem}
+        return {**app, "pem": pem, "webhook_secret": self.data.get("webhook_secret")}
 
     def receive(self, code: str, state: str) -> dict:
         with self.lock:
@@ -323,7 +377,9 @@ class SetupSession:
             created = github("POST", f"/app-manifests/{quote(code, safe='')}/conversions",
                              timeout=min(30, remaining))
             app_id, slug, pem = str(created["id"]), created["slug"], created["pem"]
+            webhook_secret = created.get("webhook_secret")
             if (not re.fullmatch(r"[1-9][0-9]*", app_id)
+                    or (webhook_secret is not None and not isinstance(webhook_secret, str))
                     or not isinstance(slug, str) or not re.fullmatch(r"[A-Za-z0-9-]+", slug)
                     or not isinstance(pem, str) or not pem.strip()):
                 raise ValueError("Invalid conversion result")
@@ -350,6 +406,7 @@ class SetupSession:
             self.data = {
                 **previous, "phase": "converted", "app": {"id": app_id, "slug": slug},
                 "pem": pem, "key_sha256": hashlib.sha256(pem.encode()).hexdigest(),
+                "webhook_secret": webhook_secret,
             }
             try:
                 self.save()  # Save the one-time response before any browser acknowledgement.
@@ -366,7 +423,7 @@ class SetupSession:
 
     def complete(self, installation_id: str) -> None:
         self.data.update(phase="complete", installation_id=installation_id)
-        for key in ("state", "pem", "code_sha256"):
+        for key in ("state", "pem", "code_sha256", "webhook_secret"):
             self.data.pop(key, None)
         self.save()
 
@@ -374,6 +431,26 @@ class SetupSession:
 def fail(message: str) -> "None":
     print(f"ERROR: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def resolve_webhook_url() -> str | None:
+    """The stack's pull request review endpoint, or None when this stack has none.
+
+    WORKSHOP_WEBHOOK_URL wins; otherwise the SSM parameter the stack publishes. A
+    missing endpoint keeps the App's webhook inactive rather than failing setup.
+    """
+    explicit = os.environ.get("WORKSHOP_WEBHOOK_URL", "").strip()
+    if explicit:
+        return explicit if explicit.startswith("https://") else None
+    try:
+        out = subprocess.run(
+            ["aws", "ssm", "get-parameter", "--name", "/workshop/webhook-url",
+             "--query", "Parameter.Value", "--output", "text"],
+            capture_output=True, text=True, timeout=20, check=True)
+        value = out.stdout.strip()
+        return value if value.startswith("https://") else None
+    except (subprocess.SubprocessError, OSError):
+        return None
 
 
 def resolve_base_url(explicit: str | None) -> str:
@@ -454,28 +531,37 @@ def github(method: str, path: str, token: str | None = None, *, timeout: float =
     return outcome["result"]
 
 
-def build_manifest(base_url: str, port: int, name: str) -> dict:
+def build_manifest(base_url: str, port: int, name: str, public: bool = False,
+                   webhook_url: str | None = None) -> dict:
     """The App this workshop needs, and nothing more.
 
     These four permissions are exactly what the Gateway's tools use: read and write
     file contents to push a branch, issues to comment gate and review evidence, pull
-    requests to open and merge them, and metadata because GitHub requires it. The
-    webhook is registered inactive because nothing in this workshop listens for one;
+    requests to open and merge them, and metadata because GitHub requires it.
+
+    With a ``webhook_url`` (the stack's review endpoint), the App subscribes to pull
+    request events and GitHub signs each delivery with the webhook secret it returns
+    on conversion. Without one the webhook is registered inactive, because
     `hook_attributes.url` is required by the manifest schema even so.
+
+    The App is private unless --public is chosen. Some GitHub accounts reject a
+    private manifest ("Public cannot be private"); a public App is still installed
+    only on the repository its owner selects, and its private key stays on this host.
     """
     return {
         "name": name,
         "url": base_url,
         "redirect_url": f"{base_url}/proxy/{port}/callback",
-        "public": False,
+        "public": public,
         "default_permissions": {
             "contents": "write",
             "issues": "write",
             "pull_requests": "write",
             "metadata": "read",
         },
-        "default_events": [],
-        "hook_attributes": {"url": f"{base_url}/proxy/{port}/webhook", "active": False},
+        "default_events": ["pull_request", "issue_comment"] if webhook_url else [],
+        "hook_attributes": ({"url": webhook_url, "active": True} if webhook_url
+                            else {"url": f"{base_url}/proxy/{port}/webhook", "active": False}),
     }
 
 
@@ -487,7 +573,7 @@ _PAGE_CSS = (
 )
 
 
-def start_page(manifest: dict, state: str) -> bytes:
+def start_page(manifest: dict, state: str, organization: str | None = None) -> bytes:
     """A page whose only job is to POST the manifest to GitHub.
 
     It has to be a POST (the manifest travels in a form field, not a query string), so
@@ -495,13 +581,16 @@ def start_page(manifest: dict, state: str) -> bytes:
     a browser that blocks the scripted submit.
     """
     body = html.escape(json.dumps(manifest), quote=True)
+    # An organization repository needs an organization-owned App: a private App
+    # owned by a person can only be installed on that person's own account.
+    owner_path = f"organizations/{quote(organization, safe='')}/" if organization else ""
     return (
         "<!doctype html><meta charset=utf-8><title>Create the workshop GitHub App</title>"
         f"<style>{_PAGE_CSS}</style>"
         "<h1>Creating your GitHub App</h1>"
         "<p>On GitHub, confirm the App name and choose <strong>Create GitHub App</strong>. "
         "Then review its permissions and select your workshop repository when you install it.</p>"
-        f'<form id="f" method="post" action="https://github.com/settings/apps/new?state={quote(state, safe="")}">'
+        f'<form id="f" method="post" action="https://github.com/{owner_path}settings/apps/new?state={quote(state, safe="")}">'
         f'<input type="hidden" name="manifest" value=\'{body}\'>'
         '<button type="submit">Continue to GitHub</button></form>'
         "<script>document.getElementById('f').submit()</script>"
@@ -542,9 +631,11 @@ class Handler(BaseHTTPRequestHandler):
                     "<p>Refresh the original GitHub callback tab while this receiver is running. "
                     "Do not create another App. If you no longer have that tab, recover the "
                     "existing App from GitHub settings using <code>--app-id</code> and "
-                    "<code>--key-file</code>.</p>"))
+                    "<code>--key-file</code>. If you never chose Create GitHub App, stop the "
+                    "terminal helper and run it with <code>--restart</code>.</p>"))
             else:
-                self._send(200, start_page(session.data["manifest"], session.data["state"]))
+                self._send(200, start_page(session.data["manifest"], session.data["state"],
+                                           session.data.get("organization")))
             return
         # Accept code-server's stripped and unstripped paths, not arbitrary paths
         # whose final component happens to be "callback".
@@ -613,10 +704,14 @@ def wait_for_callback(session: SetupSession, *, resuming: bool) -> dict:
     try:
         if resuming:
             print("\nReceiver resumed for the SAME App. Refresh the original failed callback tab.")
-            print("Do not open a new GitHub App registration.\n")
+            print("Do not open a new GitHub App registration.")
+            print("If you never chose 'Create GitHub App' on GitHub, press Ctrl+C and run:")
+            print("    python3 create-github-app.py --restart\n")
         else:
             print("\nOpen this URL in the SAME browser you are using for VS Code:\n")
             print(f'    {session.data["base_url"]}/proxy/{session.data["port"]}/\n')
+            print("If a 'Welcome to code-server' page asks for a password, enter the")
+            print("WorkshopPassword from Event outputs; it then continues to GitHub.")
             print("On GitHub, confirm the App name and choose 'Create GitHub App'.")
             print("Then review its permissions and install it on your workshop repository.\n")
         print("This receiver waits at most ten minutes. If it stops, run this helper with --resume.")
@@ -674,12 +769,107 @@ def wait_for_installation(app_id: str, pem: str, expect_owner: str | None) -> st
     raise AssertionError("unreachable")
 
 
-def write_env(app_id: str, key_path: Path, installation_id: str) -> None:
+def github_owner_type(owner: str) -> str | None:
+    """'Organization' or 'User' from GitHub's public profile; None when GitHub cannot say."""
+    try:
+        request = urllib.request.Request(
+            f"{GITHUB_API}/users/{quote(owner, safe='')}",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "agentcore-workshop"})
+        with urllib.request.urlopen(request, timeout=8) as response:
+            kind = json.loads(response.read(65536)).get("type")
+    except Exception:  # noqa: BLE001 (offline or rate-limited: fall back to a personal App)
+        return None
+    return kind if kind in ("Organization", "User") else None
+
+
+def organization_for(repo: str) -> str | None:
+    """The organization that must own the App, after telling the attendee what that needs."""
+    owner = repo.split("/")[0]
+    if github_owner_type(owner) != "Organization":
+        return None
+    print(f"\n{owner} is a GitHub organization, so the App will be registered by that")
+    print("organization. That needs an organization owner or GitHub App manager. If you")
+    print("are not one, press Ctrl+C and create the workshop repository under your")
+    print("personal account instead (recommended for the workshop).")
+    return owner
+
+
+def saved_summary() -> str:
+    """A best-effort ' for owner/repo (App 'name')' for a checkpoint that may be foreign."""
+    try:
+        data = json.loads(private_bytes(STATE_FILE))
+        return f" for {data['repo']} (App '{data['name']}')"
+    except (SetupError, ValueError, KeyError, TypeError):
+        return ""
+
+
+def abandon_unfinished_setup() -> None:
+    """Move aside a setup that never reached GitHub's Create step, keeping it as evidence.
+
+    Only an awaiting_callback checkpoint qualifies: no code was exchanged, so no private
+    key exists for it. If its App was created on GitHub anyway, that App has no key and
+    no installation; the message names it so the attendee can delete it."""
+    if not (STATE_FILE.exists() or STATE_FILE.is_symlink()):
+        return
+    try:
+        data = json.loads(private_bytes(STATE_FILE))
+        phase, name = data["phase"], data["name"]
+    except (SetupError, ValueError, KeyError, TypeError):
+        raise SetupError("The saved setup cannot be read; preserve it and ask a facilitator.") from None
+    if phase != "awaiting_callback":
+        raise SetupError(
+            f"The saved setup already created App '{name}'. Use --resume, or --app-id and "
+            "--key-file; --restart would abandon its private key.")
+    archived = STATE_FILE.with_name(f"{STATE_FILE.name}.abandoned-{int(time.time())}")
+    os.rename(STATE_FILE, archived)
+    print(f"Set aside the unfinished setup for '{name}' ({archived.name}).")
+    print("If an App with that name appears under GitHub Settings > Developer settings > "
+          "GitHub Apps, it has no private key; you can delete it.")
+
+
+def discover_key_file() -> Path:
+    """The one private key on this host, when --key-file was not given."""
+    if DEFAULT_KEY_PATH.exists():
+        return DEFAULT_KEY_PATH
+    candidates = sorted({path.resolve() for folder in (REPO_ROOT, ENV_FILE.parent, Path.home())
+                         for path in folder.glob("*.private-key.pem")})
+    if len(candidates) == 1:
+        print(f"Using private key {candidates[0]}")
+        return candidates[0]
+    if not candidates:
+        raise SetupError(
+            "No private key found on this host. In the App's GitHub settings choose "
+            "'Generate a private key', drag the .pem into the VS Code Explorer, then pass "
+            "--key-file PATH.")
+    raise SetupError("Several private keys found; pass --key-file with one of: "
+                     + ", ".join(str(path) for path in candidates))
+
+
+def read_key(path: Path) -> str:
+    raw = str(path)
+    if raw != raw.strip().strip("'\""):
+        # A drag-and-drop path keeps its quotes through `read -r`.
+        raise SetupError(f"Remove the quotes or spaces around the key path: {raw}")
+    if not path.exists():
+        raise SetupError(f"No private key file at {path}. Check the path; the file GitHub "
+                         "downloaded ends in .private-key.pem.")
+    try:
+        return private_bytes(path).decode()
+    except SetupError:
+        if path.exists() and not path.is_symlink() and stat.S_IMODE(path.stat().st_mode) & 0o077:
+            raise SetupError(f"The key file is readable by others. Run: chmod 600 {path}") from None
+        raise SetupError(f"Could not read the private key at {path}.") from None
+
+
+def write_env(app_id: str, key_path: Path, installation_id: str,
+              webhook_secret: str | None = None) -> None:
+    secret_line = (f"export GITHUB_APP_WEBHOOK_SECRET={shlex.quote(webhook_secret)}\n"
+                   if webhook_secret else "")
     atomic_private_write(ENV_FILE, (
         "# Written by create-github-app.py. Source it, then run ./deploy-all.sh\n"
         f"export GITHUB_APP_ID={app_id}\n"
         f"export GITHUB_APP_PRIVATE_KEY_FILE={shlex.quote(str(key_path))}\n"
-        f"export GITHUB_APP_INSTALLATION_ID={installation_id}\n").encode())
+        f"export GITHUB_APP_INSTALLATION_ID={installation_id}\n" + secret_line).encode())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -694,23 +884,35 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--app-id", help="finish an App whose private key is already on disk")
     mode.add_argument("--resume", action="store_true",
                       help="resume the saved App setup, without creating another App")
+    mode.add_argument("--restart", action="store_true",
+                      help="set aside a setup that never reached GitHub's Create step, then start again")
+    parser.add_argument("--public", action="store_true",
+                        help="register a public App, only if GitHub rejects the private "
+                             "manifest with 'Public cannot be private'")
     args = parser.parse_args(argv)
     try:
-        repo = args.repo if args.repo is not None else os.environ.get("GITHUB_REPO")
+        raw_repo = args.repo if args.repo is not None else os.environ.get("GITHUB_REPO")
+        repo = normalize_repo(raw_repo) if raw_repo is not None else None
         port = args.port if args.port is not None else (
             int(os.environ["MANIFEST_PORT"]) if "MANIFEST_PORT" in os.environ else None)
         key_override = Path(args.key_file).expanduser().absolute() if args.key_file else None
         if port is not None and not 1 <= port <= 65535:
             raise SetupError("The callback port must be between 1 and 65535.")
-        if repo and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
-            raise SetupError("Pass the workshop repository as owner/repository.")
+        if repo and not _REPO_SHAPE.fullmatch(repo):
+            raise SetupError(repo_problem(repo))
+        if repo and repo != (raw_repo or "").strip():
+            print(f"Using repository {repo}")
+        if args.public and (args.resume or args.app_id):
+            raise SetupError("--public applies only to a new setup; combine it with --restart.")
         with setup_lock():
             session = None
-            if args.app_id:
+            # `is not None`: Enter at the page's "Existing App ID" prompt passes an
+            # empty value, which used to start a NEW registration instead of failing.
+            if args.app_id is not None:
                 if not re.fullmatch(r"[1-9][0-9]*", args.app_id):
                     raise SetupError("The App id must be a positive integer.")
-                key_path = key_override or DEFAULT_KEY_PATH
-                pem = private_bytes(key_path).decode()
+                key_path = key_override or discover_key_file()
+                pem = read_key(key_path)
                 app_id = args.app_id
             else:
                 base_url = normalized_base_url(resolve_base_url(args.base_url))
@@ -719,20 +921,27 @@ def main(argv: list[str] | None = None) -> int:
                     session.check_context(base_url, repo, port, key_override)
                 else:
                     if not repo:
-                        raise SetupError("Set GITHUB_REPO or pass --repo owner/repository before starting App setup.")
+                        raise SetupError("Set GITHUB_REPO or pass --repo owner/repository before "
+                                         "starting App setup (for example: export "
+                                         "GITHUB_REPO=\"octocat/my-agent-project\").")
+                    if args.restart:
+                        abandon_unfinished_setup()
                     session = SetupSession.create(
-                        base_url, port or 8765, repo, key_override or DEFAULT_KEY_PATH)
+                        base_url, port or 8765, repo, key_override or DEFAULT_KEY_PATH, args.public,
+                        organization_for(repo))
                 key_path, repo = Path(session.data["key_file"]), session.data["repo"]
                 if session.data["phase"] in {"converted", "complete"}:
                     created = session.credentials()
                 else:
                     created = wait_for_callback(session, resuming=args.resume)
                 app_id, pem = created["id"], created["pem"]
+                webhook_secret = created.get("webhook_secret")
                 print(f"App id {app_id}; private key saved at {key_path}")
                 print(f'Install this App: https://github.com/apps/{created["slug"]}/installations/new')
             owner = repo.split("/")[0] if repo and "/" in repo else None
             installation_id = wait_for_installation(app_id, pem, owner)
-            write_env(app_id, key_path, installation_id)
+            write_env(app_id, key_path, installation_id,
+                      webhook_secret if session is not None else None)
             if session is not None:
                 session.complete(installation_id)
     except SetupError as exc:

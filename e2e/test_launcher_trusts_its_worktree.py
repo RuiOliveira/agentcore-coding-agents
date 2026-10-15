@@ -52,11 +52,31 @@ def test_the_launcher_trusts_the_worktree_it_is_given(role, tmp_path):
     assert project["hasCompletedProjectOnboarding"] is True
 
 
-def test_the_backend_launcher_resolves_its_directory_before_trusting_it():
-    """RUN_DIR must be known when the settings block runs, or it trusts the wrong
-    directory. It is WORKSHOP_AGENT_WORKDIR on a dispatched turn and HOME by hand."""
+def _resolve_run_dir(cwd, workdir=None) -> str:
+    """Run the launcher's own RUN_DIR block in bash from ``cwd`` and print the result."""
     src = open(LAUNCHERS["claude-code"], encoding="utf-8").read()
-    run_dir_at = src.index('RUN_DIR="${WORKSHOP_AGENT_WORKDIR:-$HOME}"')
+    block = src[src.index('if [ -n "${WORKSHOP_AGENT_WORKDIR:-}" ]; then'):]
+    block = block[:block.index("\nfi\n") + 4]
+    env = {k: v for k, v in os.environ.items() if k != "WORKSHOP_AGENT_WORKDIR"}
+    env["HOME"] = "/home/agent"
+    if workdir:
+        env["WORKSHOP_AGENT_WORKDIR"] = workdir
+    proc = subprocess.run(["bash", "-c", block + 'printf %s "$RUN_DIR"'], cwd=cwd, env=env,
+                          text=True, capture_output=True, check=True)
+    return proc.stdout
+
+
+def test_the_backend_launcher_resolves_its_directory_before_trusting_it(tmp_path):
+    """RUN_DIR must be known when the settings block runs, or it trusts the wrong
+    directory. It is WORKSHOP_AGENT_WORKDIR on a dispatched turn; by hand it is the
+    folder the person changed into, or HOME from a fresh shell at /."""
+    src = open(LAUNCHERS["claude-code"], encoding="utf-8").read()
+    run_dir_at = src.index('RUN_DIR="$WORKSHOP_AGENT_WORKDIR"')
     trust_at = src.index("hasTrustDialogAccepted")
     assert run_dir_at < trust_at
     assert 'CLAUDE_PROJECT_DIR="$RUN_DIR" python3 -' in src
+
+    folder = str(tmp_path.resolve())
+    assert _resolve_run_dir(folder, "/tmp/workshop-0123456789ab") == "/tmp/workshop-0123456789ab"
+    assert _resolve_run_dir(folder) == folder
+    assert _resolve_run_dir("/") == "/home/agent"

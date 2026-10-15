@@ -73,7 +73,6 @@ import os
 import re
 import secrets
 import shutil
-import socket
 import subprocess
 import sys
 import threading
@@ -154,8 +153,21 @@ import reviewer  # noqa: E402
 import presets  # noqa: E402
 import role_graph  # noqa: E402  (the agent-execution phase as a Strands graph)
 import run_store  # noqa: E402  (durable run state: a verdict outlives its session)
+# The reporting projection (public views, next_action, redaction) lives in
+# run_views.py; re-exported so engine.X keeps working for every caller and test.
+from run_views import (  # noqa: E402,F401
+    _NEXT_ACTION, _RESUBMITTABLE_REASONS, _SECRET_RE, _published_rows, _redact,
+    next_action, public_events, public_progress, public_result, public_run,
+    public_submitter, public_terminals, resubmission_allowed,
+)
 import roles  # noqa: E402  (the ONE declarative roster)
 import work_items as _work_items  # noqa: E402  (isolated role checkouts + candidate)
+from gate_diagnostics import (  # noqa: E402
+    MAX_FAILURE_LINES as _MAX_FAIL_LINES,
+    MAX_FAILURE_LINE_CHARS,
+    extract_failure_lines as _gate_fail_lines,
+    gate_failure_lines,
+)
 
 # Frozen contract enums (API_CONTRACT.md): the engine's public vocabulary.
 PHASES = ["admission", "context_hydration", "pre_flight", "agent_execution", "finalization"]
@@ -220,15 +232,6 @@ _OUTPUT_TAIL_PER_ROLE = 12
 # carrying the prompt and the wrapper. It is not what the role is doing, and it is the
 # only line long enough to matter, so length alone separates them.
 _OUTPUT_LINE_MAX = 1000
-# Agent output is arbitrary text, and this tail is persisted to the runtime bucket. No
-# credential is on the dispatch path by construction (roles authenticate with the
-# Runtime's own IAM role, and a brokered vendor key is command-substituted, never
-# echoed), so this is defence in depth for a role that prints one anyway.
-_SECRET_RE = re.compile(
-    r"\b(?:ksk_[A-Za-z0-9_-]{8,}"
-    r"|gh[pousr]_[A-Za-z0-9]{8,}"
-    r"|(?:AKIA|ASIA)[0-9A-Z]{8,}"
-    r"|sk-[A-Za-z0-9_-]{12,})")
 # Escape-sequence remains, after runtime_exec's per-line clean has already run. A frame
 # boundary can split ESC from the rest of a sequence, so the parameters and the final
 # byte arrive with nothing left to identify them as control: `[?2004h` (bracketed paste,
@@ -239,10 +242,6 @@ _PTY_RESIDUE_RE = re.compile(r"\[\??[\d;]*\d[A-Za-z]")
 # A line worth showing has a letter or a digit in it. Prompt furniture (`>`, box-drawing,
 # spinner frames) does not, and a TUI emits a great deal of it.
 _WORDLIKE_RE = re.compile(r"[A-Za-z0-9]")
-
-
-def _redact(text: str) -> str:
-    return _SECRET_RE.sub("[redacted]", text)
 
 
 def _persistable_activity(run: "Run") -> dict:
@@ -325,35 +324,17 @@ _NO_PRODUCER_ERROR = (
 # still a schema we invented. One subprocess, no conventions.
 _ACCEPTANCE_CHECK = "acceptance_check"
 
-# How many of the check's own failing lines a repair round is given. The check writes
-# whatever it likes, so this reads the lines rather than parsing a format: a line that
-# announces a failure is one starting with FAIL, or one that says "failed"/"error"
-# without being a PASS line. Capped because the output is already truncated to 4000
-# characters upstream and a builder prompt is not the place for a full test log.
-_MAX_FAIL_LINES = 25
-
-
-def _gate_fail_lines(output: str) -> list[str]:
-    """Pull the failing lines out of a validator-authored check's own output.
-
-    No format is assumed or required. The validator picks its own language and its own
-    reporting style, so this looks for the words a failure is announced with and keeps
-    the order they appeared in. Returning nothing is fine and normal: some checks say
-    only "VERDICT: REJECT", and the caller simply has less to pass on."""
-    hits: list[str] = []
-    for raw in (output or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        upper = line.upper()
-        if upper.startswith(("PASS", "OK", "INFO", "SKIP")):
-            continue
-        if upper.startswith(("FAIL", "ASSERT", "ERROR", "NOT OK", "✗", "×")) or (
-                "FAILED" in upper and "0 FAILED" not in upper):
-            hits.append(line[:300])
-        if len(hits) >= _MAX_FAIL_LINES:
-            break
-    return hits
+def _gate_failure_feedback(gate: dict) -> str:
+    """Give either builder the check's bounded diagnostics, including early failures."""
+    lines = gate_failure_lines(gate)
+    if not lines:
+        return ""
+    return (
+        "\n\nThe check's own failure diagnostics "
+        f"(first up to {_MAX_FAIL_LINES} matching lines, "
+        f"up to {MAX_FAILURE_LINE_CHARS} characters per line):\n"
+        + "\n".join(f"  {line}" for line in lines)
+    )
 
 # What compose must NOT publish. Two kinds, and both were observed on a live run:
 #   * the HARNESS we installed into the role's working directory (its steering file
@@ -392,9 +373,9 @@ _COMPOSE_SKIP_SUFFIXES = (".pyc", ".pyo", ".db", ".db-wal", ".db-shm",
 def _compose_excluded(rel: str) -> bool:
     """True when ``rel`` is scaffolding or run-time state, not the deliverable.
 
-    Used for the PULL REQUEST only. The gate uses ``_gate_excluded``, which is
-    narrower: a file that merely reads badly in a diff is still part of the
-    workspace the authored check was written against.
+    The pull request and the gate checkout both build on this through
+    ``_work_patch_excluded``, which also withholds the staged acceptance check, so
+    the check runs against exactly the source a role's patch can contain.
     """
     parts = rel.replace(os.sep, "/").split("/")
     if any(p in _COMPOSE_SKIP_DIRS for p in parts[:-1]):
@@ -403,24 +384,6 @@ def _compose_excluded(rel: str) -> bool:
     if name in _COMPOSE_SKIP_NAMES or name.startswith(_COMPOSE_SKIP_PREFIXES):
         return True
     return name.endswith(_COMPOSE_SKIP_SUFFIXES)
-
-
-def _gate_excluded(rel: str) -> bool:
-    """True when ``rel`` is OUR harness rather than the agents' workspace.
-
-    Deliberately withholds only what the engine installed. Everything the roles
-    (or the running deliverable) put in the workspace reaches the gate, because
-    the check was authored against that workspace and the engine does not get to
-    decide which of those files the check is allowed to see.
-    """
-    parts = rel.replace(os.sep, "/").split("/")
-    if parts[0] == "skills":
-        return True
-    if any(p in ("__pycache__", ".git") for p in parts[:-1]):
-        return True
-    name = parts[-1]
-    # Not a withheld file so much as not a file at all: see _COMPOSE_SKIP_PREFIXES.
-    return name in _COMPOSE_SKIP_NAMES or name.startswith(_COMPOSE_SKIP_PREFIXES)
 
 
 def _work_patch_excluded(rel: str) -> bool:
@@ -456,8 +419,8 @@ _SCOPE_RULE = (
     "Choose files and abstractions to support the requested scope.\n"
     "- Cover EVERY feature the shared brief assigns to YOUR role, and honour its "
     "non-functional asks literally (if data must survive a restart, an in-memory "
-    "dict is a failure even when the checks pass in one process). The combined team "
-    "owns the full request; do not duplicate a sibling's assignment in your patch.\n"
+    "dict is a failure even when the checks pass in one process). Preserve the "
+    "ownership assigned in the brief.\n"
     "You still choose the language, the framework, the files, and the structure. "
     "This constrains the standard of the work, not its shape.\n")
 
@@ -623,21 +586,11 @@ def _validator_agent() -> str:
             "WORKSHOP_ROLES; there is nothing to fall back to.")
     return checkers[0]
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
 
 def _files(n: int) -> str:
     """"1 file" / "6 files". A role's note is now reviewer-facing text on the pull
     request body, not an internal status string, so it reads like prose."""
     return f"{n} file" + ("" if n == 1 else "s")
-
-
-def _py(snippet: str) -> str:
-    """One-liner python for terminal transcripts (kept readable in the pane)."""
-    return f"python3 -c {json.dumps(snippet)}"
 
 
 @dataclass
@@ -741,6 +694,18 @@ class Run:
     # from reaching their gates. Keep its reason until those PRs settle.
     _initial_execution_failure: str | None = field(default=None, repr=False)
     _refresh_context: str = ""
+    # A checker-only round: author checks for exactly these work ids, run no builder.
+    _check_subjects: set[str] | None = field(default=None, repr=False)
+    # Under auto merge, a pull request whose dependency merges first has its check
+    # written AFTER that merge, against the branch it merges into, instead of twice.
+    _deferred_checks: set[str] = field(default_factory=set, repr=False)
+    # Pull requests already published in the current execution round.
+    _published_round: set[str] = field(default_factory=set, repr=False)
+    # A green, approved pull request merged while a slower builder still worked
+    # (work_id -> its role_prs row), and a result that must wait for finalization
+    # (work_id -> (gate, approved, stage)) because its repair cannot run mid-graph.
+    _early_rows: dict[str, dict] = field(default_factory=dict, repr=False)
+    _early_gates: dict[str, tuple] = field(default_factory=dict, repr=False)
     # work_id -> the authored check path for THAT pull request. One check per pull
     # request, so this replaces the single _acceptance_test_file on the verdict path
     # (which is kept for the read-only review route and the compose commit).
@@ -1467,7 +1432,7 @@ class Engine:
                 result = runtime_exec.run_in_runtime(
                     runtime_arn=arn, agent_id=agent_id, prompt=prompt,
                     run_subdir=run_subdir, artifact_rel=artifact_rel,
-                    model=llm.resolve(model),
+                    model=self._wire_model(agent_id, model),
                     region=runtime_exec.region_for(arn),
                     on_line=on_line, timeout_s=HARNESS_ROLE_TIMEOUT_S)
                 break
@@ -1558,21 +1523,7 @@ class Engine:
                 feedback = ("\n\nPrevious round's review REQUESTED CHANGES on the "
                             "pull request. Address each point:\n"
                             + "\n".join(f"- {d}" for d in failed))
-            # ...and the check's OWN FAIL lines, which are the only thing that says
-            # WHICH assertion broke. Measured on a live run: the check reported
-            # "141 checks run, 1 failed" and the builder received only that one-line
-            # summary, so its repair round spent 11 minutes rediscovering the failure
-            # by re-reading its own code. The evidence already existed in
-            # gate["output"] and already reached the pull request; it just never
-            # reached the role that had to act on it.
-            #
-            # This does NOT tell the builder what to build. It reports what the
-            # checker OBSERVED, exactly as a CI log does, and the check still decides.
-            fail_lines = _gate_fail_lines((run.review.get("gate") or {}).get("output", ""))
-            if fail_lines:
-                feedback += ("\n\nThe check's own failing lines (it decides the gate, "
-                             "so treat these as the specification of what to fix):\n"
-                             + "\n".join(f"  {line}" for line in fail_lines))
+            feedback += _gate_failure_feedback(run.review.get("gate") or {})
         if run._refresh_context:
             feedback += "\n\n" + run._refresh_context
         # The dispatched role, not a fixed id: role.agent is whichever role the
@@ -1596,20 +1547,18 @@ class Engine:
         # backend is Claude Code today (CLAUDE.md), but WORKSHOP_ROLES can serve a role
         # whose native steering file has another name.
         builder_steering = roles.get(agent_id).steering_file.replace("\\", "/")
+        ownership = integration_plan.ownership_guidance(self._builder_items(run))
         prompt = (
             "You are the backend implementer role in a multi-agent build. Read "
             f"{builder_steering} in this directory for your role, and read the "
             "shared `.workshop/integration-brief.md` before changing code. It "
-            "defines the boundary you share with the other builders, not an "
-            "implementation you must copy. Read the "
+            "defines your assignment and any shared boundaries. Read the "
             f"`{staged}/skills/backend-engineering/SKILL.md` harness staged for this "
             "run (also baked at ~/skills/backend-engineering/SKILL.md) and apply it.\n\n"
             f"THE REQUEST: {run.task}\n\n"
             "YOUR EXCLUSIVE ASSIGNMENT:\n"
             f"{json.dumps(assignment, indent=2)}\n\n"
-            "Implement that assignment and its side of the shared contract. Your "
-            "isolated checkout is not supposed to contain the other builders' work; "
-            "do not make it standalone by adding their capability.\n\n"
+            f"{ownership}\n\n"
             "Decide everything else yourself: the language, the framework, the files, "
             "the structure, the protocol. Nobody has prescribed a shape. Read the "
             f"request carefully; any material it refers to is staged read-only under "
@@ -1667,19 +1616,22 @@ class Engine:
                 "the shared brief; do not invent a service unless that assignment "
                 "requires one.\n")
         conflict_feedback = ""
+        if run.iterations > 1 and run.review:
+            conflict_feedback += _gate_failure_feedback(run.review.get("gate") or {})
         if run._refresh_context:
             conflict_feedback += "\n\n" + run._refresh_context
+        ownership = integration_plan.ownership_guidance(self._builder_items(run))
         prompt = (
             "You are the frontend builder role in a multi-agent build. Read "
             "AGENTS.md in this directory for your role, and read the "
             "shared `.workshop/integration-brief.md` before changing code. It "
-            "defines the boundary you share with the other builders, not an "
-            "implementation you must copy. Read the "
+            "defines your assignment and any shared boundaries. Read the "
             f"`{staged}/skills/frontend-design/SKILL.md` harness staged for this run "
             "and apply it.\n\n"
             f"THE REQUEST: {run.task}\n\n"
             "YOUR EXCLUSIVE ASSIGNMENT:\n"
             f"{json.dumps(assignment, indent=2)}\n\n"
+            f"{ownership}\n\n"
             + backend +
             "Decide everything yourself: the files, the structure, the framework, the "
             "styling, the interactions. Nobody has prescribed a shape or a filename. "
@@ -1687,13 +1639,11 @@ class Engine:
             "if the request points at an existing interface, read it and carry it "
             "forward rather than starting generic. Write your work in THIS directory.\n\n"
             "TWO rules, and they are browser facts rather than preferences:\n"
-            "- RESOLVE the backend address at RUNTIME; never hardcode a host or port "
-            "as the only option. Take an explicit override first (a query parameter), "
-            "then a value a host page injected, then default to the page's OWN ORIGIN. "
-            "A page is normally served by the same process that answers its calls, so "
-            "same-origin must work with no configuration. `localhost` inside a browser "
-            "means the machine the BROWSER runs on, so a baked loopback URL reaches "
-            "nothing once the page moves. Show the resolved address in the UI.\n"
+            "- If the interface calls a service, preserve its existing request contract "
+            "and hosting path, including any proxy prefix. Keep relative routes and "
+            "supported endpoint configuration working through the actual page URL. "
+            "Do not hardcode a host or port as the only option. Verify reads and writes "
+            "through that page URL.\n"
             "- Every value a user sees comes from a backend call. Render the response, "
             "or the backend's own error; never compute an answer locally and never "
             "invent one to fill a gap.\n\n"
@@ -1989,6 +1939,13 @@ class Engine:
                 # become WORK_PATCH_MISSING attributed to the checker. Other
                 # builders' completed candidates remain eligible.
                 continue
+            if progress is not None and progress.state in ("working", "pending"):
+                # The checker can start before a builder whose check waits for its
+                # dependency; that builder's PR is published when its turn ends.
+                continue
+            if item.work_id in run._published_round:
+                continue
+            run._published_round.add(item.work_id)
             if self.executor.name == "fixture":
                 item.state = "in_review"
                 item.stale = False
@@ -2172,9 +2129,11 @@ class Engine:
                 "\n\nThe base branch advanced because another pull request merged. "
                 "Inspect this checkout as it exists now; do not assume the prior "
                 "check is still correct.")
-        live = (f"The deliverable is running at {endpoint} .\n"
+        live = (f"Reference URL: {endpoint}. Your check runs against an isolated "
+                "checkout and must start any service it needs.\n"
                 if endpoint else
-                "The deliverable does not expose a running service this round.\n")
+                "No reference URL is available. Your check must start any "
+                "service it needs.\n")
         integration_context = integration_plan.review_context(
             run.integration_brief or {},
             self._builder_items(run),
@@ -2206,14 +2165,22 @@ class Engine:
             "(JavaScript/TypeScript). Git metadata is local: the execution "
             "checkout's workshop-base ref contains the current default-branch "
             "snapshot and HEAD contains this pull request's tree. These local "
-            "snapshot commit IDs are not GitHub commit IDs. Your check is staged "
-            "as an untracked file beside the committed source.\n\n"
+            "snapshot commit IDs are not GitHub commit IDs. The engine keeps "
+            "your executable outside the application tree. Resolve application "
+            "files from WORKSHOP_WORK_DIR or the process working directory, "
+            "never from the executable's own path.\n\n"
             "YOU decide what 'acceptable' means for this request. Nobody has given "
             "you a checklist, a contract, or a list of required checks, because only "
             "you have seen this particular task. Read the request, inspect the "
             "pull request tree cloned into this checkout, and encode the checks "
             "that would "
-            "convince a skeptical engineer that the request was met. Prefer evidence "
+            "convince a skeptical engineer that the request was met. Keep the "
+            "scope proportional: a new product needs its complete core flow; a "
+            "focused change needs the changed behavior, its failure boundary, and "
+            "the adjacent behavior it could break. Inspect the diff and reuse "
+            "available runtime tools before building checking infrastructure. "
+            "Judge observable outcomes, not internal helper names or call counts "
+            "unless the request makes those part of its interface. Prefer evidence "
             "over assumption: probe the running deliverable over the wire where it "
             "can prove something, and inspect the files where it cannot. This is a "
             "gate on ONE pull request: verify that what it contributes works, and "
@@ -2232,7 +2199,8 @@ class Engine:
             "deliverable's URL from the `DELIVERABLE_URL` env var"
             + (f" (it will be {endpoint!r})" if endpoint else "") + ". Do not soften "
             "a real failure, and do not rubber-stamp. You do NOT edit the work; you "
-            "only check it. Write ONLY the file; do not run it.\n\n"
+            "only check it. Write ONLY the file; do not run its acceptance "
+            "behavior.\n\n"
             "IF THE DELIVERABLE IS A SERVICE, YOUR CHECK MUST START IT ITSELF, wait "
             "for it to accept connections, and stop it when it is done. NOTHING ELSE "
             "STARTS IT FOR YOU: no process is running when your check begins, so a "
@@ -2254,10 +2222,14 @@ class Engine:
             "for.\n\n"
             "KEEP THE CHECK ITSELF EXECUTABLE: do not pass quoted test data through "
             "nested shell/source snippets such as `python -c` or `node -e`; serialize "
-            "payloads with the check language's native JSON support. Before handing "
+            "payloads with the check language's native JSON support. Pass whole "
+            "numbers to every process and network timeout, rounding any computed "
+            "budget first. Before handing "
             "the file off, run a PARSE-ONLY syntax check (`bash -n`, "
-            "`python -m py_compile`, or `node --check`, as appropriate). Do not run "
-            "the acceptance behavior; the engine owns that one real execution."
+            "`python -m py_compile`, or `node --check`, as appropriate). If the file "
+            "has its own parser controls, run it once with WORKSHOP_CHECK_SELFTEST=1 "
+            "(controls only, no deliverable) and fix the check until they pass. Do "
+            "not run the acceptance behavior; the engine owns that one real execution."
             + feedback)
         result = self._runtime_cli(run, _validator_agent(), role, prompt, model,
                                    _ACCEPTANCE_CHECK)
@@ -2356,23 +2328,15 @@ class Engine:
                 f"({count} source files; the check is outside the application tree)")
         return staged
 
-    def _write_validator_report(self, run: Run, role: RoleResult,
-                                grade_tail: str) -> None:
-        """Write a fixture-only trace note for the offline plumbing test.
-
-        The shipped path never calls this: its validator authors the executable
-        gate, and verdict evidence lands on the PR rather than in a report file.
-        """
-        report_path = os.path.join(run.roledir(_validator_agent()), "validation_report.md")
-        if self.executor.name == "fixture":
-            with open(report_path, "w", encoding="utf-8") as f:
-                f.write("validation report: the fixture executable ran; "
-                        "see its output above.\n")
-            run.add_event(_validator_agent(), {"kind": "text",
-                                   "text": "[validator] wrote validation_report.md "
-                                           "(fixture trace only)"})
-            return
-        raise RuntimeError(_NO_PRODUCER_ERROR)
+    @staticmethod
+    def _wire_model(agent_id: str, model: str) -> str:
+        """The model name this role's CLI receives. Bedrock aliases resolve to ids;
+        a CLI with its own model names gets the name unchanged. The two overlap:
+        on 2026-09-27 Kiro's `claude-sonnet-5` resolved to a Bedrock profile id and
+        kiro-cli answered "Model 'global.anthropic.claude-sonnet-5' does not exist"."""
+        if roles.get(agent_id).model_namespace != "bedrock":
+            return model
+        return llm.resolve(model)
 
     @staticmethod
     def _role_model(run: Run, agent_id: str, default: str) -> str:
@@ -2381,7 +2345,7 @@ class Engine:
         same per-task override surface a production model selector exposes.
 
         The roster ``default`` is itself wirable at deploy time so an event whose
-        account lacks a given model (e.g. Opus 4.6 without a Bedrock Marketplace
+        account lacks a given model (for example, one without a Bedrock Marketplace
         subscription) can retarget a role without a code edit:
         ``WORKSHOP_MODEL_<AGENT_ID>`` (agent-specific, e.g.
         ``WORKSHOP_MODEL_CLAUDE_CODE``) wins over the generic ``WORKSHOP_MODEL``,
@@ -2506,10 +2470,24 @@ class Engine:
             # request never blocks a green sibling from merging.
             self._publish_active_work_items(run)
             install_harness(role.agent)
-            subjects = [
-                item for item in self._builder_items(run, pending_only=True)
-                if item.agent in active_builders
-            ]
+            if run._check_subjects is not None:
+                subjects = [
+                    item for item in self._builder_items(run, pending_only=True)
+                    if item.work_id in run._check_subjects
+                ]
+            else:
+                subjects = [
+                    item for item in self._builder_items(run, pending_only=True)
+                    if item.agent in active_builders
+                ]
+                waiting = [item for item in subjects
+                           if self._check_waits_for_dependency(run, item)]
+                for item in waiting:
+                    run._deferred_checks.add(item.work_id)
+                    run.log(f"validator: {item.work_id}'s check is written after "
+                            f"{', '.join(item.depends_on)} merges, once, against the "
+                            "branch it merges into")
+                subjects = [item for item in subjects if item not in waiting]
             # A repair selects its owner, not every still-open PR. Preserve the
             # other PRs' check paths, including evidence awaiting its first gate,
             # and never redispatch a sibling's failed check-authoring turn.
@@ -2729,6 +2707,17 @@ class Engine:
             if (roles.get(agent_id).kind == roles.CHECKER
                 or agent_id in active_builders)
         ]
+        run._published_round = set()
+        # The checker waits only for the builders whose checks it writes now. A builder
+        # whose check waits for its dependency keeps building in parallel.
+        checker_waits_for = None
+        if run._check_subjects is None:
+            deferred_agents = {
+                item.agent for item in self._builder_items(run, pending_only=True)
+                if item.agent in active_builders
+                and self._check_waits_for_dependency(run, item)}
+            if deferred_agents and deferred_agents != set(active_builders):
+                checker_waits_for = set(active_builders) - deferred_agents
         # Builders start as one entry batch. The checker is selected for this round,
         # but does not become "working" until its graph node actually starts after
         # every selected builder finishes. Builders not selected for repair keep
@@ -2754,8 +2743,14 @@ class Engine:
         try:
             graph, _nodes = role_graph.build_graph(
                 execution_agents, lambda a: _make_dispatch(run.progress[a], a),
-                execution_timeout=max(1.0, deadline - time.monotonic()))
+                execution_timeout=max(1.0, deadline - time.monotonic()),
+                checker_waits_for=checker_waits_for,
+                after_partial=(lambda: self._finalize_ready_early(run))
+                if checker_waits_for is not None else None)
             role_graph.run_graph(graph)
+            # Builders that finished after the checker started publish now.
+            if checker_waits_for is not None:
+                self._publish_active_work_items(run)
         except Exception as exc:                # noqa: BLE001
             # A graph that could not be built or driven is a PHASE failure, reported as
             # such. It is never a pass: any role left "working" is caught by the
@@ -2797,6 +2792,11 @@ class Engine:
             # attendee actually reads.
             if any(r.agent in turn_limited for r in errored):
                 reason = "ROLE_TURN_LIMIT"
+            elif any("ROLE_PR_PUBLISH_ERROR" in (r.note or "") for r in errored):
+                # The builder finished; GitHub refused its pull request. Reporting
+                # this as a transient role failure told people to resubmit into the
+                # same refusal.
+                reason = "ROLE_PR_PUBLISH_ERROR"
             elif any("MODEL_QUOTA_EXHAUSTED" in (r.note or "") for r in errored):
                 reason = "MODEL_QUOTA_EXHAUSTED"
             elif all("ARTIFACT_TRANSFER_ERROR" in (r.note or "") for r in errored):
@@ -2904,7 +2904,8 @@ class Engine:
             item for item in self._builder_items(run)
             if run.progress[item.agent].state == "done"
             and item._patch is not None and item.pr
-            and run._item_checks.get(item.work_id)
+            and (run._item_checks.get(item.work_id)
+                 or item.work_id in run._deferred_checks)
         ]
 
     def _record_gate(self, run: Run, gate: dict, stage: str,
@@ -2922,6 +2923,9 @@ class Engine:
             "summary": gate.get("summary") or "",
             "checks": list(gate.get("checks") or []),
         }
+        failures = gate_failure_lines(gate)
+        if failures:
+            row["failure_lines"] = failures
         if gate.get("check_evidence"):
             row["check_evidence"] = dict(gate["check_evidence"])
         run.gate_history.append(row)
@@ -3165,9 +3169,15 @@ class Engine:
         for item in pending:
             previous_base_digest = item.base_digest or _work_items.tree_digest(
                 run.item_base_dir(item.agent), exclude=_work_patch_excluded)
+            # A clean rebase onto a merged dependency is republished without an owner
+            # turn: its check, written on the new branch, judges the integration, and a
+            # red result gets the ordinary bounded repair with the fail lines. On
+            # October 13 the extra owner turn produced a byte-identical patch and cost
+            # 77 s plus a second check. WORKSHOP_SEMANTIC_REFRESH=1 restores it.
             dependency_advanced = (
                 merged_item.work_id in item.depends_on
                 and previous_base_digest != latest_digest
+                and os.environ.get("WORKSHOP_SEMANTIC_REFRESH", "") == "1"
             )
             seed = os.path.join(run.workdir, f"refresh-{item.work_id}")
             conflicts = _work_items.prepare_refresh_checkout(
@@ -3386,25 +3396,62 @@ class Engine:
             "state": "checking",
         } for item in items]
 
+        last_merged: _work_items.WorkItem | None = None
         for item, row in zip(items, run.role_prs):
+            early_row = run._early_rows.get(item.work_id)
+            if early_row:
+                # Already gated, reviewed and merged while a slower builder worked.
+                row.update(early_row)
+                if item.merge_state == "merged":
+                    last_merged = item
+                continue
             if initial_failure and item.work_id not in checkable:
                 row["state"], row["error"] = "blocked", initial_failure
                 item.merge_state = "blocked"
+                # Say so on the PR: when the checker failed after this PR opened (a
+                # bad Kiro key, the seat cap), the PR carried no evidence at all.
+                self._comment_work_item(run, item, (
+                    f"**No check was run** ({initial_failure}). The checker did not "
+                    "produce an executable for this pull request, so it has no verdict. "
+                    "Read the run's next action before merging or resubmitting."))
                 continue
-            stage = f"{item.work_id} round {item.attempt}"
-            run.log(f"gate: running {item.work_id}'s authored check "
-                    f"on {run.final_base_branch}")
-            gate = self._gate_one_pull_request(run, item, stage)
-            approved = gate.get("passed") and self._assess_pull_request(
-                run, item, gate, stage)
+            if last_merged is not None:
+                refreshed = self._refresh_after_sibling_merge(run, item, last_merged)
+                if refreshed:
+                    row["state"], row["error"] = "blocked", refreshed
+                    item.merge_state = "blocked"
+                    continue
+            if (item.work_id in run._deferred_checks
+                    and not run._item_checks.get(item.work_id)):
+                missing = self._author_deferred_check(run, item)
+                if missing:
+                    row["state"], row["error"] = "blocked", missing
+                    item.merge_state = "blocked"
+                    self._comment_work_item(run, item, (
+                        f"**No check was run** ({missing}). The checker did not produce "
+                        "an executable for this pull request, so it has no verdict. A "
+                        "person decides what happens next."))
+                    continue
+            early = run._early_gates.pop(item.work_id, None)
+            if early is not None:
+                # Gated (and, when green, reviewed) during execution; act on it here.
+                gate, approved, stage = early
+            else:
+                stage = f"{item.work_id} round {item.attempt}"
+                run.log(f"gate: running {item.work_id}'s authored check "
+                        f"on {run.final_base_branch}")
+                gate = self._gate_one_pull_request(run, item, stage)
+                approved = gate.get("passed") and self._assess_pull_request(
+                    run, item, gate, stage)
             if not approved and not gate.get("passed"):
                 # A red gate is never approved; say so on the pull request without
                 # asking the reviewer, whose own red-gate branch would say the same.
                 self._assess_pull_request(run, item, gate, stage)
 
             if not approved and item.merge_state != "review_unavailable":
-                # ONE bounded repair for THIS pull request only.
-                if item.attempt >= MAX_ITERATIONS:
+                # ONE bounded repair for THIS pull request only. A dependency
+                # refresh is its own budget: it does not spend the repair.
+                if item.attempt >= MAX_ITERATIONS + item.dependency_refreshes:
                     row["state"] = "blocked"
                     row["error"] = "ITERATION_CAP"
                     item.merge_state = "blocked"
@@ -3414,11 +3461,20 @@ class Engine:
                     continue
                 if not self._repair_pull_request(run, item, gate, stage):
                     row["state"] = "blocked"
+                    # Keep the specific stop (a turn limit, an exhausted model quota)
+                    # instead of a generic role error, and say on the PR that its
+                    # repair did not complete: the timeline used to end at "repair
+                    # requested", and the run said the check "stayed red".
                     row["error"] = (
-                        "ROLE_TURN_LIMIT" if run.fail_reason == "ROLE_TURN_LIMIT"
+                        run.fail_reason if run.fail_reason in _REPAIR_STOPS
                         else "CHECK_REQUIRES_HUMAN" if not run._active_builders
                         else "ROLE_EXECUTION_ERROR")
                     item.merge_state = "blocked"
+                    self._comment_work_item(run, item, (
+                        f"**Repair did not complete** ({row['error']}). The builder's "
+                        "repair turn for this pull request stopped before it produced a "
+                        "change, so the check was not run again. The evidence above is "
+                        "still the latest; a person decides what happens next."))
                     continue
                 stage = f"{item.work_id} round {item.attempt}"
                 gate = self._gate_one_pull_request(run, item, stage)
@@ -3446,9 +3502,130 @@ class Engine:
                 continue
             self._merge_if_policy_allows(run, item, row)
             row["pr_url"] = (item.pr or {}).get("pr_url")
+            if item.merge_state == "merged":
+                last_merged = item
 
         self._settle_run(run, items)
         return True
+
+    def _finalize_ready_early(self, run: Run) -> None:
+        """Gate, review and merge green pull requests while a slower builder works.
+
+        Called by the role graph right after the checker wrote this round's checks,
+        before the builders whose checks come later have finished. Only the fast path
+        runs here: in merge order, a pull request whose dependencies are merged is gated
+        on the branch as it stands, reviewed, and merged when green and approved. A red
+        gate, a review finding, or an unavailable review stops this pass; its result is
+        kept, unchanged, for finalization, which owns the bounded repair. So the verdict
+        rules are exactly finalization's; only the time they run moves.
+        """
+        if github.merge_policy() != "auto":
+            return
+        by_id = {w.work_id: w for w in run.work_items.values()}
+        for item in self._builder_items(run, pending_only=True):
+            if (not run._item_checks.get(item.work_id)
+                    or item.work_id in run._deferred_checks
+                    or run.progress[item.agent].state != "done" or not item.pr
+                    or any((by_id.get(d) is not None and by_id[d].merge_state != "merged")
+                           for d in item.depends_on)):
+                break
+            stage = f"{item.work_id} round {item.attempt}"
+            run.log(f"gate: running {item.work_id}'s authored check on "
+                    f"{run.final_base_branch} now, while the other builders work")
+            try:
+                gate = self._gate_one_pull_request(run, item, stage)
+                approved = bool(gate.get("passed")) and self._assess_pull_request(
+                    run, item, gate, stage)
+            except Exception as exc:  # noqa: BLE001 (finalization runs it instead)
+                run.log(f"{item.work_id}: the early gate did not complete ({exc}); "
+                        "finalization runs it", "warn")
+                break
+            if not approved or item.merge_state == "review_unavailable":
+                run._early_gates[item.work_id] = (gate, approved, stage)
+                break
+            row = {"work_id": item.work_id, "agent": item.agent, "role": item.role,
+                   "pr_url": (item.pr or {}).get("pr_url"), "state": "checking"}
+            self._merge_if_policy_allows(run, item, row)
+            row["pr_url"] = (item.pr or {}).get("pr_url")
+            run._early_rows[item.work_id] = row
+            run.role_prs = [r for r in run.role_prs if r.get("work_id") != item.work_id] + [row]
+            if item.merge_state != "merged":
+                break
+
+    def _check_waits_for_dependency(self, run: Run, item: _work_items.WorkItem) -> bool:
+        """Under auto merge, a dependency that will merge first moves this PR's base.
+
+        Writing its check now would grade a branch that is about to change, and the
+        check would be written again after the merge (the base moved). So it waits
+        and is written once. A dependency that failed or already merged does not wait.
+        """
+        if github.merge_policy() != "auto" or not item.depends_on:
+            return False
+        by_id = {w.work_id: w for w in run.work_items.values()}
+        for dep_id in item.depends_on:
+            dep = by_id.get(dep_id)
+            if dep is None or dep.merge_state in ("merged", "blocked"):
+                continue
+            if run.progress.get(dep.agent) is not None and \
+                    run.progress[dep.agent].state == "error":
+                continue
+            return True
+        return False
+
+    def _author_deferred_check(self, run: Run, item: _work_items.WorkItem) -> str:
+        """Write a deferred pull request's check now, on the branch as it stands.
+
+        A checker-only round: no builder runs. Returns "" when a check exists, or the
+        reason none does (the PR is then blocked with no verdict, never graded)."""
+        run._deferred_checks.discard(item.work_id)
+        prior_active, prior_phase = run._active_builders, run.phase
+        run._check_subjects, run._active_builders = {item.work_id}, set()
+        run.log(f"validator: writing {item.work_id}'s check now, against "
+                f"{run.final_base_branch} as it stands")
+        try:
+            self._execute(run, defer_failure=True)
+        finally:
+            run._check_subjects, run._active_builders = None, prior_active
+            run.phase = prior_phase
+        if run._item_checks.get(item.work_id):
+            return ""
+        return run.fail_reason or "CHECK_NOT_AUTHORED"
+
+    def _refresh_after_sibling_merge(
+        self, run: Run, item: _work_items.WorkItem, merged: _work_items.WorkItem
+    ) -> str:
+        """Bring this pull request onto the branch a sibling just merged into.
+
+        The per-PR loop gates each pull request against the default branch AS IT
+        STANDS, so once a sibling merged, a later pull request that changed one of
+        the same paths is stale. Before October 13 nothing refreshed it: its gate
+        reported STALE_PATCH, the ordinary repair re-ran its owner on the OLD base,
+        and the same stale patch came back. A clean rebase is republished without an
+        agent turn; a conflict, or a dependency that just merged, gets its owner one
+        bounded refresh turn on the new base. Returns "" to continue to the gate, or
+        the reason this pull request now needs a person.
+        """
+        try:
+            active = self._refresh_pending_work(run, [item], merged)
+        except RuntimeError as exc:
+            reason = str(exc)
+            if not reason.startswith(("STALE_PATCH_", "ROLE_PR_REFRESH_ERROR:")):
+                raise
+            run.log(reason, "warn")
+            return reason.split(":", 1)[0]
+        if not active:
+            return ""
+        run._active_builders = {item.agent}
+        run.iterations += 1
+        run.log(f"{item.work_id}: one bounded refresh onto the branch "
+                f"{merged.work_id} merged into", "warn")
+        if not self._execute(run, defer_failure=True):
+            self._comment_work_item(run, item, (
+                "**Refresh did not complete.** A sibling pull request merged first and "
+                "this one needed its owner to reconcile the shared paths, but that turn "
+                "stopped before it produced a change. A person decides what happens next."))
+            return run.fail_reason if run.fail_reason in _REPAIR_STOPS else "ROLE_EXECUTION_ERROR"
+        return ""
 
     def _repair_pull_request(
         self, run: Run, item: _work_items.WorkItem, gate: dict, stage: str
@@ -3498,20 +3675,25 @@ class Engine:
         if (run._initial_execution_failure == "ROLE_TURN_LIMIT"
                 or any(row.get("error") == "ROLE_TURN_LIMIT" for row in run.role_prs)):
             run.status, run.fail_reason = "needs_human", "ROLE_TURN_LIMIT"
+        elif any(row.get("error") == "MODEL_QUOTA_EXHAUSTED" for row in run.role_prs):
+            # "Do not resubmit now" must survive a repair that hit the quota.
+            run.status, run.fail_reason = "needs_human", "MODEL_QUOTA_EXHAUSTED"
         elif run._initial_execution_failure:
             run.status, run.fail_reason = (
                 "needs_human", run._initial_execution_failure)
-        elif unavailable:
-            run.status, run.fail_reason = (
-                "needs_human",
-                "REVIEW_UNAVAILABLE:" + ",".join(i.work_id for i in unavailable))
         elif blocked:
+            # A real finding on one PR outranks a review outage on another: the
+            # outage's "do not rebuild" advice must not hide a PR a person must fix.
             run.status, run.fail_reason = (
                 "needs_human",
                 "ROLE_PR_BLOCKED:" + ",".join(i.work_id for i in blocked))
             run.log(
                 f"{len(settled)} pull request(s) settled, "
                 f"{len(blocked)} left open for a person", "warn")
+        elif unavailable:
+            run.status, run.fail_reason = (
+                "needs_human",
+                "REVIEW_UNAVAILABLE:" + ",".join(i.work_id for i in unavailable))
         elif not settled:
             run.status, run.fail_reason = "needs_human", "ROLE_PR_BLOCKED:none"
         else:
@@ -3810,68 +3992,9 @@ class Engine:
 
 
 # ------------------------------------------------------------------ public views
-def public_submitter(identity: dict | None) -> str | None:
-    """Expose only the user label recorded when the build was admitted."""
-    if isinstance(identity, dict):
-        for key in ("user_email", "user_id"):
-            value = identity.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
-
-
-def public_run(run: Run) -> dict:
-    return {
-        "run_id": run.run_id,
-        "task": run.task,
-        "status": run.status,
-        "phase": run.phase,
-        "created_at": run.created_at,
-        "submitted_by": public_submitter(run.user_identity),
-        "agents": run.agents,
-        "roles": run.roles,
-        # additive (API_CONTRACT.md "Engine additions"): the router's verdict
-        "route": run.route,
-        # Why a run stopped (RUNTIME_NOT_WIRED:<role>, HARNESS_MISSING:<role>, …)
-        # so the console states the real reason instead of a bare "needs_human":
-        # a fail-loud verdict must be legible, never look like a silent mock.
-        "fail_reason": run.fail_reason,
-    }
-
-
-def public_progress(run: Run) -> list[dict]:
-    return [
-        {"agent": r.agent, "role": r.role, "state": r.state,
-         "latency_ms": r.latency_ms, "tokens": r.tokens,
-         "cost_usd": r.cost_usd, "note": r.note, "engine": r.engine}
-        for r in run.progress.values()
-    ]
-
-
-def public_terminals(run: Run) -> dict:
-    """Per-role shell transcripts: the console streams these into xterm panes."""
-    with run._lock:
-        return {agent: list(lines) for agent, lines in run.terminals.items()}
-
-
-def public_events(run: Run) -> dict:
-    """Per-role events the console renders as one feed, in arrival order.
-
-    Structured events (text/thinking/tool_use/tool_result) first, then the rolling
-    tail of what the role's CLI is PRINTING (kind ``output``). Both, for the same
-    reason the watcher shows both: on a dispatched run the engine is the only producer
-    of structured events, so a feed of those alone showed one summary line per role
-    while the role was working.
-    """
-    with run._lock:
-        feeds = {agent: [dict(e) for e in evs]
-                 for agent, evs in run.role_events.items()}
-        for agent, lines in run.role_output.items():
-            feeds.setdefault(agent, []).extend(
-                {"kind": "output", "text": _redact(line)} for line in lines)
-    return feeds
-
-
+# The reporting projection (public_run, public_result, next_action, ...) lives in
+# run_views.py and is re-exported above; public_diff stays here because it reads
+# the engine's own _RUNS_DIR.
 def public_diff(run: Run) -> dict:
     """The REAL composed change as a per-file unified diff, for the session
     Changes tab (the local twin of the PR's Files-changed). Reads the run's own
@@ -3911,269 +4034,6 @@ def public_diff(run: Run) -> dict:
             "files": files}
 
 
-# What an attendee should DO about each terminal reason. Idea from
-# awslabs/aidlc-workflows v2, whose stage checkboxes say WHO IS BLOCKING at a glance
-# (`[?]` awaiting you, `[R]` revising) rather than making you decode a state name.
-#
-# Our `needs_human` covers two very different situations: validation stayed blocked
-# on real work (read the gate and review evidence) and a role never produced anything
-# (a transport or turn failure, just resubmit). Same status, opposite next action,
-# and the raw token said neither.
-_NEXT_ACTION = {
-    # A blocked run may already have merged some pull requests while another stayed
-    # red. ITERATION_CAP can mean a red executable OR a required review finding.
-    "ITERATION_CAP":
-        "Do not resubmit this request. The candidate still had blocking gate or "
-        "review evidence after the bounded re-implement round, so no final "
-        "integration pull request was opened. Read the latest gate.summary and the "
-        "integrated review evidence on the existing role pull requests.",
-    "ROLE_EXECUTION_ERROR":
-        "A role's turn produced no usable work. This is usually transient: submit the "
-        "SAME request again. Do not try to finish it by dispatching one role by hand.",
-    "ROLE_TURN_LIMIT":
-        "A role reached its configured CLI turn limit. Do not resubmit this "
-        "request automatically. Read the role's recorded limit error and original "
-        "request. If pull requests exist, inspect their recorded checks and reviews. "
-        "A person must decide how to narrow the request or continue the work. "
-        "A fresh shell would restart the same bounded task.",
-    # Distinct from the above ON PURPOSE: the agent SUCCEEDED and its work is still
-    # in the runtime workspace. Saying "the role produced nothing" here would send
-    # the reader to debug an agent that did its job.
-    "ARTIFACT_TRANSFER_ERROR":
-        "The role's work exists in its runtime workspace but the engine could not "
-        "read it back, so this is our transport failure and not a failed agent turn. "
-        "Submit the SAME request again; the workspace listing is in the fail reason.",
-    "ROLE_TOTAL_FAILURE":
-        "EVERY routed role failed, which points at the harness or the environment "
-        "rather than the request: check that each role's runtime is wired and READY, "
-        "then resubmit.",
-    "MODEL_QUOTA_EXHAUSTED":
-        "The selected model's daily token allowance is exhausted. Do not resubmit "
-        "now. Wait for the allowance to reset or choose a model with available "
-        "capacity, then submit the SAME request once.",
-    "ROLE_PR_BLOCKED":
-        "One or more pull requests did not become mergeable: their check stayed red, "
-        "a review finding remained after the one bounded repair, or the merge itself "
-        "was refused. The work ids are in the reason. Open each named pull request, "
-        "read its executable check and Assessment comment, and continue from there as "
-        "a person. Pull requests that did pass are already settled; do not resubmit "
-        "the whole build to retry one of them.",
-    "STALE_PATCH_REFRESH_CAP":
-        "A pull request fell behind the default branch and used up its one bounded "
-        "refresh. Open the named pull request, update its branch yourself, and "
-        "re-run its check as a person.",
-    "STALE_PATCH_EMPTY_REFRESH":
-        "After a sibling merged, the named pull request had nothing left to "
-        "contribute: its change is already on the default branch. Close it, or open "
-        "it and confirm nothing is missing.",
-    "WORK_TREE_MISSING":
-        "The validator authored a check but the pull request tree it was authored "
-        "against is gone, so nothing could be executed. This is an engine-side "
-        "failure, not a failed agent turn: retry the same request once.",
-    "REVIEW_UNAVAILABLE":
-        "The executable check passed, but the required review did not run for the "
-        "named pull request(s). Keep them open and retry after model access is "
-        "restored; do not ask builders to change code for this outage.",
-    "ENGINE_STALL":
-        "The run ended without reaching a verdict. Resubmit; if it stalls again, the "
-        "engine log for this run id is the place to look.",
-    "COORDINATOR_SESSION_INTERRUPTED":
-        "The coordinator Runtime was recycled while the background build was active. "
-        "Submit the SAME request again and keep polling that session until it reaches "
-        "a terminal status.",
-    "NO_RUN_TO_REVIEW":
-        "A review-only request needs an earlier run to review. Submit a build first.",
-    "PRESET_NOT_SPECIFIED":
-        "No task text and no preset. Say what you want built, or name a preset from "
-        "list_presets.",
-    "NO_BUILDER_ROUTED":
-        "The route selected no maker, so nothing would be built. Name a preset or a "
-        "role set that includes a builder.",
-    "NO_CHECKER_ROUTED":
-        "The route selected no checker, so nothing would verify the work. Every build "
-        "route must carry the validator.",
-    "NO_ROLES_ROUTED":
-        "The route selected no roles at all. Name a preset or an explicit role set.",
-}
-
-
-def next_action(status: str, fail_reason: str | None,
-                pr: dict | None = None, pr_url: str | None = None,
-                role_prs: list[dict] | None = None) -> str:
-    """One sentence telling the reader what to do about this outcome.
-
-    Derived, never stored: the reason is the fact, this is how to read it. An
-    unrecognised reason returns "" rather than inventing advice.
-
-    ``pr`` matters because the most common outcome is a run that PASSED, and a passing
-    run still has two very different endings: the pull request opened (go read it) or
-    it did not (the work is real but stranded in a local branch, and nothing else in
-    the payload says so at a glance). The PR failure is NOT a fail_reason -- the build
-    genuinely succeeded -- so it can only be read from the PR result.
-    """
-    if status == "passed":
-        pr = pr or {}
-        rows = list(role_prs or [])
-        merged = [r for r in rows if r.get("state") == "merged"]
-        waiting = [r for r in rows if r.get("state") == "awaiting_review"]
-        if waiting:
-            return (
-                f"{len(waiting)} pull request(s) passed their check and review and "
-                "are open for you to merge. Read each one's Assessment comment, then "
-                "merge it (or set WORKSHOP_MERGE_POLICY=auto to have the engine "
-                "merge approved pull requests itself).")
-        if merged:
-            return (
-                f"{len(merged)} pull request(s) passed their own check and review "
-                "and merged into the default branch. Read each one's Assessment "
-                "comment for the evidence.")
-        if pr_url:
-            return ("Open the role pull request and read its executable check and "
-                    "Assessment comment.")
-        pr_error = str(pr.get("error") or "")
-        if pr_error.startswith("PR_NO_GATEWAY"):
-            return (
-                "The build completed without a GitHub side effect. Wire the GitHub "
-                "MCP Gateway and submit a new run to create real pull requests.")
-        if pr_error.startswith("PR_NO_CREDENTIAL"):
-            return ("The build passed but the App credential did not resolve, so no PR "
-                    "was opened. Re-run deploy-credential.sh, then resubmit.")
-        if pr_error:
-            return (f"The build passed but the PR step failed: {pr_error[:160]}. Run "
-                    "`python3 orchestrator/github.py doctor`.")
-        return ""
-    reason = (fail_reason or "").split(":")[0].strip()
-    if reason in {"ROLE_EXECUTION_ERROR", "ROLE_TOTAL_FAILURE",
-                  "ARTIFACT_TRANSFER_ERROR"}:
-        opened = [r for r in (role_prs or []) if r.get("pr_url")]
-        if opened:
-            return (
-                f"A role failed, but {len(opened)} existing pull request(s) retain "
-                "their own recorded check and review evidence. Read that evidence "
-                "and the failed role's error before continuing as a person. "
-                "Do not resubmit the whole build to finish one role.")
-    if reason == "COORDINATOR_SESSION_INTERRUPTED":
-        # A recycled coordinator does not un-open the pull requests it already
-        # published, and telling the reader to "submit the SAME request again" when
-        # one of them is green and approved is how you get a duplicate sixty-minute
-        # three-role build. Seen live (2026-09-03): the backend pull request had
-        # passed 65 checks and been approved, the frontend one was red, and this
-        # sentence still said resubmit. Same principle the ITERATION_CAP text
-        # already states: pull requests that did pass are settled.
-        rows = list(role_prs or [])
-        opened = [r for r in rows if r.get("pr_url")]
-        if opened:
-            return (
-                f"The coordinator Runtime was recycled, but {len(opened)} pull "
-                "request(s) it already opened are unaffected. Open each one and read "
-                "its executable check and Assessment comment: that is the durable "
-                "record. Continue from there as a person, and do NOT resubmit the "
-                "whole build to finish one pull request.")
-    if reason in _NEXT_ACTION:
-        return _NEXT_ACTION[reason]
-    if reason.startswith("PR_PREFLIGHT_ERROR"):
-        # The reason string carries the specific cause (which half of the GitHub
-        # config is missing). Without this branch a terminal needs_human/failed run
-        # answered next_action: "" -- the one field whose whole job is to say what to
-        # do, empty, on a run that stopped before any agent started.
-        detail = (fail_reason or "").split(":", 2)[-1].strip()
-        return ("The run stopped in pre-flight, before any agent work or cost: "
-                + (detail or "the GitHub pull-request destination did not resolve.")
-                + " Fix that, then resubmit.")
-    if reason.startswith("RUNTIME_NOT_WIRED"):
-        return ("A routed role has no wired runtime ARN. Deploy that role (Lab 1) or "
-                "wire its ARN, then resubmit; the engine never falls back to a local "
-                "build.")
-    if reason.startswith(("UNKNOWN_PRESET", "UNKNOWN_ROLE")):
-        return "That preset or role does not exist. Call list_presets for what does."
-    # No PR_NO_GATEWAY branch here on purpose: a failed PR step never becomes a
-    # fail_reason (the BUILD succeeded), it lands in run.pr["error"], which the
-    # status == "passed" arm above reads. A branch here would be unreachable.
-    return ""
-
-
-_RESUBMITTABLE_REASONS = {
-    "ROLE_EXECUTION_ERROR",
-    "ARTIFACT_TRANSFER_ERROR",
-    "ROLE_TOTAL_FAILURE",
-    "ENGINE_STALL",
-    "COORDINATOR_SESSION_INTERRUPTED",
-    # The validator authored a check and the engine then lost the tree it was
-    # authored against, so nothing was ever executed. That is OUR bookkeeping
-    # failure, not a judged outcome: no verdict was reached, so there is nothing
-    # for a person to read and repeating the request is the honest recovery. It is
-    # deliberately NOT grouped with ROLE_PR_BLOCKED / ITERATION_CAP, which mean a
-    # real gate or review decided against real work.
-    "WORK_TREE_MISSING",
-}
-
-
-def resubmission_allowed(status: str, fail_reason: str | None,
-                         role_prs: list[dict] | None = None) -> bool:
-    """Whether immediately repeating the same request can recover this outcome.
-
-    ``role_prs`` is what makes this honest for an interrupted coordinator: a run that
-    already published pull requests has real, judged work on GitHub, so repeating the
-    request duplicates it rather than recovering it. Resubmission stays allowed only
-    while nothing was published yet.
-    """
-    if status not in ("failed", "needs_human"):
-        return False
-    reason = (fail_reason or "").split(":")[0].strip()
-    if reason not in _RESUBMITTABLE_REASONS:
-        return False
-    if any(row.get("pr_url") for row in (role_prs or [])):
-        return False
-    return True
-
-
-def public_result(run: Run) -> dict:
-    return {
-        "run_id": run.run_id,
-        "submitted_by": public_submitter(run.user_identity),
-        "status": run.status,
-        # CLI users poll this payload for 10-20 minutes. A bare "running" makes a
-        # healthy build indistinguishable from a stuck one even though the engine
-        # already tracks each role. Keep the same phase/progress facts the console
-        # exposes on its Run endpoint.
-        "phase": run.phase,
-        "progress": public_progress(run),
-        "work_items": {
-            agent: item.public()
-            for agent, item in run.work_items.items()
-        },
-        "integration_brief": run.integration_brief,
-        "integration_base": run.integration_base,
-
-        "final_base_branch": run.final_base_branch,
-        "role_prs": run.role_prs,
-        "gate_history": run.gate_history,
-        # The gate's summary is the authored check's own last line: the closest thing
-        # to a human-readable verdict, so it belongs in the public payload.
-        "gate": {"passed": bool(run.gate and run.gate["passed"]),
-                 "checks": (run.gate or {}).get("checks", []),
-                 "summary": (run.gate or {}).get("summary", "")},
-        "pr_url": run.pr_url,
-        "merge_state": run.merge_state,
-        # A run rejected at admission (empty task, bad roles) has `agents` from the
-        # request but no `roles` yet, so read through `roles` rather than indexing it:
-        # a failed run must still render its result, not 500 the API.
-        "composed_from": [run.roles[a] for a in run.agents if a in run.roles],
-        "iterations": run.iterations,
-        # additive fields (API_CONTRACT.md "Engine additions"):
-        "artifact_endpoint": run.artifact_endpoint,
-        "composed_branch": run.composed_branch,
-        "composed_commit": run.composed_commit,
-        "fail_reason": run.fail_reason,
-        "route": run.route,
-        "review": run.review,
-        "pr": run.pr,
-        "compose_base": run.compose_base,
-        # What to DO about this outcome, in one sentence. `needs_human` alone cannot
-        # tell "the gate stayed red on real work" from "a role produced nothing",
-        # and those have opposite next steps.
-        "next_action": next_action(
-            run.status, run.fail_reason, run.pr, run.pr_url, run.role_prs),
-        "resubmission_allowed": resubmission_allowed(
-            run.status, run.fail_reason, run.role_prs),
-    }
+# Stops a failed repair keeps as its own reason rather than a generic role error.
+_REPAIR_STOPS = frozenset({"ROLE_TURN_LIMIT", "MODEL_QUOTA_EXHAUSTED",
+                           "ROLE_PR_PUBLISH_ERROR", "ARTIFACT_TRANSFER_ERROR"})

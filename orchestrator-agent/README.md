@@ -14,7 +14,6 @@ routing projects in that language.
 |---|---|
 | `main.py` | Runtime HTTP entrypoint and Strands streaming adapter |
 | `session_activity.py` | Register background builds with the Runtime async-task lifecycle |
-| `model/load.py` | Bedrock model construction |
 | `stage_engine.py` | Stage the root coordinator and use cases into the build context |
 | `configure_deploy.py` | Wire role ARNs, IAM roles, and account settings into generated CLI config |
 | `promote_runtime.py` | Verify the selected platform on the current CLI/CDK Runtime; update it when needed |
@@ -36,8 +35,10 @@ actually idle session can still expire; terminal results remain in the run store
 
 ## Deploy the coordinator
 
-Complete Lab 1 and the GitHub Gateway setup first. In the terminal where
-`GITHUB_GATEWAY_URL`, `GITHUB_REPO`, and `AWS_REGION` are set, deploy with:
+Complete Lab 1 and the GitHub Gateway setup first. The wrapper reads the same
+saved Gateway and repository settings as `github.py doctor`, so a new terminal
+works too. Explicit `GITHUB_GATEWAY_URL` and `GITHUB_REPO` exports take priority.
+With your AWS region configured, deploy with:
 
 ```bash
 cd ~/sample-amazon-bedrock-agentcore-coding-agents/orchestrator-agent
@@ -80,9 +81,20 @@ otherwise return exit code zero. An error, empty answer, or 180-second timeout
 stops the script before it prints the build-submission instructions.
 
 Export model settings before running the script. It forwards the stack's
-`WORKSHOP_CLAUDE_MODEL`, `WORKSHOP_CODEX_MODEL`, and `WORKSHOP_SMALL_MODEL`
-values into the coordinator process. `ORCHESTRATOR_MODEL_ID` independently
-selects the coordinator's chat model. Existing `WORKSHOP_MODEL` and
+`WORKSHOP_CLAUDE_MODEL`, `WORKSHOP_CODEX_MODEL`, `WORKSHOP_SMALL_MODEL`, and
+`WORKSHOP_REVIEW_MODEL` values into the coordinator process.
+`WORKSHOP_REVIEW_MODEL` selects the integrated PR reviewer independently from
+the backend. For example, an event can select these models separately:
+
+```bash
+export WORKSHOP_CLAUDE_MODEL=global.anthropic.claude-opus-5
+export WORKSHOP_REVIEW_MODEL=global.anthropic.claude-sonnet-5
+```
+
+Set both before `deploy-coordinator.sh`. Without an explicit review model,
+the reviewer uses `WORKSHOP_CLAUDE_MODEL`, then Sonnet 5 as its fallback.
+`ORCHESTRATOR_MODEL_ID` independently selects the coordinator's chat model.
+Existing `WORKSHOP_MODEL` and
 `WORKSHOP_MODEL_<ROLE>` overrides still take precedence for role dispatch;
 per-request model choices take precedence over those. Blank named defaults
 are omitted. Credentials are not copied from the host environment.

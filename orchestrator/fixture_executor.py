@@ -54,7 +54,9 @@ def _is_checker(agent_id: str, role: Any) -> bool:
 
 # The validator stub, as a real executable. It checks only that the builders left
 # something behind: enough to be a true statement about the run, and nothing about
-# what was built. FIXTURE_CHECK_EXIT lets a test drive a real nonzero exit.
+# what was built. FIXTURE_CHECK_EXIT lets a test drive a real nonzero exit; it is
+# written into the check when it is authored, because a check inherits no test
+# variables (reviewer._check_environment).
 _CHECK_BODY = """#!/bin/sh
 # Offline acceptance check (test double). Deliberately content-free: it verifies a
 # deliverable tree exists, never what is in it.
@@ -72,7 +74,7 @@ if grep -l '^fixture repair pending$' "$WORKSHOP_WORK_DIR"/*-work.txt >/dev/null
   echo "check: first round rejected; fixture builder repair pending"
   exit 1
 fi
-exit ${FIXTURE_CHECK_EXIT:-0}
+exit @EXIT@
 """
 
 
@@ -110,7 +112,8 @@ class FixtureExecutor(executor.Executor):
         os.makedirs(workdir, exist_ok=True)
         if _is_checker(agent_id, role):
             path = os.path.join(workdir, "acceptance_check")
-            body = _CHECK_BODY
+            exit_code = os.environ.get("FIXTURE_CHECK_EXIT", "0")
+            body = _CHECK_BODY.replace("@EXIT@", exit_code if exit_code.isdigit() else "0")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(body)
             os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP

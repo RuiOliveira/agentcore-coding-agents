@@ -23,17 +23,12 @@ build_and_push_arm64() (
     [ "$6" = "--toolchain" ] || { echo "Unknown build option: $6" >&2; return 2; }
     local tools_dir
     tools_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    # This function runs in a subshell. Keep the cleanup path in that scope:
-    # Bash 3 unwinds function-local variables before an errexit EXIT trap.
-    workshop_build_stage="$(mktemp -d "${TMPDIR:-/tmp}/workshop-image.XXXXXX")"
-    trap 'rm -rf -- "$workshop_build_stage"' EXIT
-    # Only this role's tracked files, its explicitly staged skill, and the two
-    # shared toolchain files enter the context. No repo-root/private config copy.
-    python3 "${tools_dir}/cli_versions.py" stage-context \
-      --source "$context" --destination "${workshop_build_stage}/context" >/dev/null
+    # The same named contexts docker-bake.hcl declares: the pinned toolchain and the
+    # builders' skills. The role's .dockerignore keeps local state and secrets out of
+    # its context, and only the Dockerfile's explicit COPY lines reach the image.
+    build_options+=(--build-context "toolchain=${tools_dir}"
+                    --build-context "skills=${tools_dir}/../harness-skills/skills")
     build_options+=(--build-arg "WORKSHOP_RUNTIME_BASE_IMAGE=$(python3 "${tools_dir}/cli_versions.py" get runtime.base_image)")
-    context="${workshop_build_stage}/context"
-    dockerfile="${context}/$(basename "$dockerfile")"
   fi
 
   # Pick a real builder: prefer docker+buildx, fall back to finch. A box with

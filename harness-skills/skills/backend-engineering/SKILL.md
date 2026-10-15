@@ -75,6 +75,18 @@ Judge that structure by how clearly it supports the task and its verification.
 - **Let the task justify the structure.** Separate concerns where it makes the
   code easier to understand, change, or verify. Choose the files and abstractions
   needed for the requested scope; keep all requested features and design requirements.
+- **Keep implementation work proportional to the result.** Prefer the capabilities
+  of your chosen tools to building a general-purpose engine or framework for one
+  task. Deliver the requested visual identity and interactions with a complete,
+  focused implementation. Additional polish and abstractions need a requirement
+  or an observed problem to justify them.
+- **Keep the public contract proportional too.** Carry the data the requested
+  behavior needs. Additional endpoints, metadata, and configuration each create
+  more implementation and verification work; add them only to satisfy the request
+  or a demonstrated boundary condition.
+- **Group independent work.** Inspect related files together and batch independent
+  tool calls when possible. Reuse the checks you have already written; expand or
+  repeat them when a change or failure gives you something new to verify.
 - **Use a real framework when the task is a real service.** A production HTTP
   service in Python is FastAPI or Flask, not a hand-rolled
   `BaseHTTPRequestHandler`; in Node it is Express or Fastify, not raw `http`.
@@ -129,15 +141,31 @@ own, and ignoring them means the call fails before your code ever runs.
 
 When you are the only builder and the request is something a person plays or clicks in
 a browser, the page is yours too, and ONE service serves both the page and its API.
-These standards come from where the result actually runs: the workshop opens it through
-a reverse proxy at a path prefix (`https://<host>/proxy/<port>/`), on a host with no
-guaranteed route to the public internet.
+These standards cover the original game behind a reverse proxy at a path prefix
+(`https://<host>/proxy/<port>/`) and a published copy on the same workshop
+CloudFront distribution. Its public `/play/` page is a trusted wrapper with no
+scripts. It embeds the game at `/play/app/` under an enforced Content Security
+Policy sandbox with an opaque origin. The sandbox allows scripts and pointer lock.
+Both copies must work with local assets and prepared dependencies.
 
 - **Every URL the page uses is relative.** Scripts, assets, and API calls resolve
   against the page's own location (a path like `scores` or `./assets/...`), never a
   root-absolute `/scores` and never a hardcoded host or port. The proxy strips the
   prefix on the way in, so a root-absolute URL leaves the proxy entirely: under a
   prefix, a page with one absolute URL loads and then silently does nothing.
+- **Build for the published browser's capabilities.** Persist durable game scores on
+  the server. Keep temporary play state in memory. Do not depend on cookies,
+  localStorage, sessionStorage, other origin-based browser storage, or service workers.
+  The host strips `Cookie` and `Authorization` from requests and `Set-Cookie`
+  from responses. Public game APIs must work without those credentials and support
+  CORS, including JSON preflight, for the sandboxed page.
+  Handle a form's `submit` event, call `event.preventDefault()`, and send its
+  data with JavaScript `fetch` to a relative API URL. The sandbox includes
+  `allow-forms`; CSP `form-action 'none'` blocks native form navigation.
+  Render confirmations and errors in the page. Do not require popups, new tabs,
+  or browser dialogs. Preserve pointer, touch, and keyboard controls within the game.
+  Document these hosting capabilities in the game's README so later changes
+  preserve them. A local browser run outside the sandbox does not verify publishing.
 - **Serve everything yourself.** No CDN, web font, or third-party script. The host may
   not reach them, and a page that depends on one fails as a blank canvas.
 - **Design the game for this request.** Choose its world, mechanics, visual language,
@@ -152,46 +180,47 @@ guaranteed route to the public internet.
   clicks or Enter presses while saving must not create duplicate records; a failed
   save must allow a deliberate retry. Verify the event handlers and state transitions,
   not only the HTTP endpoint they eventually call.
-- **The score interface is the shared boundary.** When the request uses the
-  workshop's room score protocol,
-  `GET /api/scores` returns saved rows, best first, with `player` and integer `score`.
-  `POST /api/scores` accepts those fields for a completed round. The browser resolves
-  `api/scores` relative to its page; the host reporter signs the central-account
-  request, so the game needs no AWS credential or central endpoint.
-  Persist scores across service restarts. Use the room's 0 to 1000 scale, with
-  higher meaning better play. Choose and document a meaningful mapping from your
-  game's progress to that scale and the achievement represented by 1000; simply
-  clipping an unbounded raw counter does not explain it. Show, save, and report the
-  same workshop score. Raw game-specific counters may also be shown with distinct
-  labels. This interface does not prescribe the game's genre or layout.
-  Other games follow their requested interfaces; do not add this protocol to an
-  unrelated task or silently replace an existing score system.
-  Defend the API: an empty or missing name, a name longer than any person would
-  type, and a missing, non-integer,
-  negative, or out-of-range score are refused with a clear error and a correct status code.
+- **Keep scores local to the game.** Explain how actual play earns a score and
+  keep displayed and saved results consistent. Persist scores across service restarts.
+  Choose the scoring rules, valid range, API routes and payloads to suit the game
+  and the request. Preserve existing interfaces and saved data when extending a game.
+  The event gallery shares playable copies without comparing scores or ranking teams.
+  The host helper handles publishing; the game needs no AWS credential or central
+  endpoint. Validate names and results against this game's contract, including
+  missing fields, invalid types and values outside its allowed range. Refuse invalid
+  submissions with a clear error and the correct status code.
 - **Start it the documented way, on the port you are given.** `PORT` (or your
   documented default) chooses the port, and the start command and how to play are in
   the documentation, not only in your head. Write that documentation as a file in the
   tree (a README is the obvious choice), because the next reader is a person or another
   agent who has your code and nothing else: the checker has to work out how to start
   this from what you wrote, and at the end of the workshop a human clones the merged
-  branch and asks an agent to run it. A deliverable nobody can start is not done.
+  branch and asks an agent to run it. Use project-relative paths so the same
+  foreground command works from a checkout or a published copy after dependency
+  setup. A deliverable nobody can start is not done.
 
 ## Prove it runs (self-verification)
 
-Do not hand off a server you have only read. Before you are done, exercise it the
-way a caller will: start it, hit its discovery and one real call over the wire,
-and confirm it answers the contract, not just that the process launched. The
-separate validator will verify independently; your own check is so you do not
-hand off something obviously broken. When you can, leave that proof behind in a
-form a reviewer can re-run, but let the task shape what that proof looks like,
-do not force a fixed filename or harness.
+Do not hand off a server you have only read. Start it the documented way from a
+clean checkout on a chosen port, drive a representative request over the wire,
+and assert the result and relevant input refusals. If the task wraps existing
+logic, prove that it calls that source live; check discovery when its protocol
+requires discovery. The separate validator will verify independently. Leave
+reproducible evidence, using the project's existing test tools where possible.
+You do not need a second general-purpose verification framework.
 
 Once the requested behavior and relevant failure cases are verified, record the
 commands and results, stop any service you started for verification, and finish
 your turn. Broaden or repeat checks only for a new change, failure, or unresolved
 requirement. If work remains incomplete or a check fails, preserve the evidence
 and name what remains; your own checks never replace the independent validator.
+
+On a repair, reproduce the reported failure against the documented contract
+before changing code. Keep previously working behavior and input refusals intact.
+Fix the demonstrated cause without widening the change into an interface redesign.
+If the check assumes behavior the request and contract do not require, record a
+concrete counterexample and explain the mismatch. Do not weaken validation or
+change unrelated behavior merely to satisfy that assumption; do not edit the check.
 
 ## Do only your side
 
@@ -200,18 +229,6 @@ when you are the only builder and the request includes a page, that page is your
 (see above). Either way you do not decide the final pass/fail verdict, a separate
 validator owns acceptance. Keep the seam clean: a stable contract is what lets the
 frontend and the validator work in parallel with you.
-
-## Verify your own work before you hand it off
-
-- The server starts from a clean checkout and serves on a chosen port. Prove it the
-  way a checker will: run your start command, and from ANOTHER shell call the
-  service. If your command returned control before you could make that call, it
-  backgrounded itself and it will read as a dead service.
-- It imports the source of truth live; grep your own output for a copied constant
-  or a duplicated formula and remove it.
-- Discovery lists exactly the intended capabilities; one real call returns the
-  source's value unchanged.
-- Bad input is rejected with the right typed error, not a wrong answer.
 
 The measure of the deliverable is not that a specific file exists; it is that the
 service starts, answers its contract over the wire, and never contradicts the

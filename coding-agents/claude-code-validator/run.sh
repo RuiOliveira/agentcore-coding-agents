@@ -105,12 +105,12 @@ fi
 
 # ── Parse --model flag ───────────────────────────────────────
 # Default model is wirable: WORKSHOP_MODEL (a deploy-time runtime env var) wins over
-# the baked default, so an event whose account has not enabled Opus 4.6 (Bedrock
-# Marketplace subscription) can point the backend at an enabled model
-# (e.g. us.anthropic.claude-sonnet-4-6) WITHOUT editing this image. An explicit
+# the baked default, so an event whose account has not enabled the default model
+# (Bedrock Marketplace subscription) can point the backend at an enabled model
+# (e.g. global.anthropic.claude-opus-5) WITHOUT editing this image. An explicit
 # --model on the command line still overrides both.
 CLAUDE_EFFORT="${WORKSHOP_CLAUDE_EFFORT:-xhigh}"
-MODEL="${WORKSHOP_MODEL:-us.anthropic.claude-opus-4-6-v1}"
+MODEL="${WORKSHOP_MODEL:-global.anthropic.claude-sonnet-5}"
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -131,7 +131,7 @@ if [ $# -gt 0 ]; then
   # --effort: reasoning budget, high by default and wirable. `claude --effort`
   # accepts low|medium|high|xhigh|max and WARNS-and-ignores anything else, so a
   # bad value degrades to the default rather than failing the run.
-  exec claude --dangerously-skip-permissions --print --max-turns 50 \
+  exec claude --dangerously-skip-permissions --print \
     ${CLAUDE_EFFORT:+--effort "$CLAUDE_EFFORT"} --model "$MODEL" "$@"
 else
   exec claude --dangerously-skip-permissions \

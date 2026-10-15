@@ -43,11 +43,21 @@ done
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-us-west-2}}"
 export AWS_REGION="${AWS_REGION:-$AWS_DEFAULT_REGION}"
 export CLAUDE_CODE_USE_BEDROCK=1
+# Command shells may omit Docker ENV; the pinned CLI must never self-update.
+export DISABLE_AUTOUPDATER=1
 export HOME="/home/agent"
 
 # An orchestrated interactive PTY hydrates one run-local linked worktree and
-# supplies it here. Manual Lab 1 shells keep the familiar HOME default.
-RUN_DIR="${WORKSHOP_AGENT_WORKDIR:-$HOME}"
+# supplies it here. A person who first cds into a folder (for example one on the
+# shared mount) works in that folder. A fresh shell starts at /, so it keeps the
+# familiar HOME default.
+if [ -n "${WORKSHOP_AGENT_WORKDIR:-}" ]; then
+  RUN_DIR="$WORKSHOP_AGENT_WORKDIR"
+elif [ "$PWD" != "/" ] && [ -w "$PWD" ]; then
+  RUN_DIR="$PWD"
+else
+  RUN_DIR="$HOME"
+fi
 
 # ── No first-run prompts (self-heal on a stale image) ─────────
 # --dangerously-skip-permissions still shows a one-time "Bypass Permissions mode?
@@ -116,8 +126,8 @@ fi
 # Match the coordinator's precedence: a role override wins over the generic
 # override, then the stack's backend default. Explicit CLI flags win over all
 # environment settings. ANTHROPIC_MODEL remains a fallback for native CLI users.
-CLAUDE_EFFORT="${WORKSHOP_CLAUDE_EFFORT-high}"
-MODEL="${WORKSHOP_MODEL_CLAUDE_CODE:-${WORKSHOP_MODEL:-${WORKSHOP_CLAUDE_MODEL:-${ANTHROPIC_MODEL:-us.anthropic.claude-opus-5}}}}"
+CLAUDE_EFFORT="${WORKSHOP_CLAUDE_EFFORT-low}"
+MODEL="${WORKSHOP_MODEL_CLAUDE_CODE:-${WORKSHOP_MODEL:-${WORKSHOP_CLAUDE_MODEL:-${ANTHROPIC_MODEL:-global.anthropic.claude-sonnet-5}}}}"
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -162,7 +172,7 @@ if [ $# -gt 0 ]; then
   # --effort: reasoning budget, high by default and wirable. `claude --effort`
   # accepts low|medium|high|xhigh|max and WARNS-and-ignores anything else, so a
   # bad value degrades to the default rather than failing the run.
-  exec claude --dangerously-skip-permissions --print --max-turns 50 \
+  exec claude --dangerously-skip-permissions --print \
     ${CLAUDE_EFFORT:+--effort "$CLAUDE_EFFORT"} --model "$MODEL" "$@"
 else
   exec claude --dangerously-skip-permissions \

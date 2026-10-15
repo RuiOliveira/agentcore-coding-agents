@@ -105,9 +105,16 @@ class _LocalShell:
 
     async def send(self, command):
         self.command = command
+        # A long command arrives in pty_typing's chunked form; the fixture still
+        # runs exactly what was typed, and reads the sentinels from what it decodes to.
+        if command.startswith("__wc="):
+            chunks = re.findall(r'^__wc="\$\{__wc\}([A-Za-z0-9+/=]*)"$', command, re.M)
+            command_text = base64.b64decode("".join(chunks)).decode()
+        else:
+            command_text = command
         match = re.search(
             r"B1=(__ROLE_RUN_BEGIN__-([0-9a-f]{12})); E1=(__ROLE_RUN_END__-[0-9a-f]{12});",
-            command,
+            command_text,
         )
         assert match
         self.begin, nonce, self.end = match.groups()
@@ -273,7 +280,7 @@ def test_generated_shell_preserves_output_and_exit(dispatch, name, stdout, stder
     assert result["session_id"] != shell.bindings["shell_id"]
     argv = json.loads(dispatch.argv.read_text())
     assert argv.count("--print") == 1
-    assert argv[argv.index("--max-turns") + 1] == "50"
+    assert "--max-turns" not in argv
     assert "--output-format" not in argv
     assert dispatch.result_archive.exists()  # Nonzero CLI exits still upload.
     assert runtime_exec.run_window_marker(shell.end) == "end"

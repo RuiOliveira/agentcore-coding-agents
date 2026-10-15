@@ -39,7 +39,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import roles as _roles
-from score_protocol import MAX_SCORE, SCORES_PATH
 
 # The roles this harness can dispatch come from the registry (``roles.py``), which
 # is the ONE place the roster is declared and is configurable at runtime
@@ -87,8 +86,8 @@ class RouteError(ValueError):
 #   * one starts from a failure (so the reproduction itself is the bar)
 #
 # `task` is the attendee's starting request, never an implementation or answer key.
-# The room's game has a small external score protocol so unlike games can report
-# to the same board. Its mechanics, look, controls, and files remain agent choices.
+# Each game owns its scoring rules. The event gallery shares playable games,
+# without requiring a common score scale or game API.
 #
 # `needs` lists CAPABILITIES, not agent ids. "backend" means "whichever role this
 # deployment serves for the service side", so a roster swap (opencode -> Codex, or
@@ -97,13 +96,14 @@ class RouteError(ValueError):
 # is not a valid route.
 PRESETS: dict[str, dict[str, Any]] = {
     # THE ROOM'S BUILD. One service, so one pull request. The deliverable is something
-    # the whole room can PLAY at the end of Lab 2, each team its own game on its own
-    # box through code-server's /proxy/<port>/ path.
+    # the whole room can PLAY at the end of its build. The host's gallery helper
+    # publishes a separate copy after the team has checked and played its game.
     #
-    # The request leaves the game open while stating the shared score protocol.
+    # The game service owns durable scores; its storage and API remain open.
     # Everything that makes the result
     # runnable where the room runs it (one service serving page and API, relative URLs
-    # behind a path prefix, no CDN, PORT, persistence, validation, documentation) is the
+    # behind a path prefix, sandbox browser capabilities, no CDN, PORT, persistence,
+    # validation, documentation) is the
     # HARNESS's job -- `harness-skills/skills/backend-engineering/SKILL.md` and the
     # validator steering -- not the prompt's. That is the point the workshop makes: a
     # person states the goal once, and the loop carries the standards. A prompt that
@@ -118,14 +118,27 @@ PRESETS: dict[str, dict[str, Any]] = {
             "controls, feedback, a meaningful earned score, a clear end state, and "
             "restart. Choose its concept and visual identity within that scope; "
             "give this team's game its own character. Reserve additional stages, "
-            "modes, and audio for a later optional Lab 3 change. "
-            f"The shared room interface is GET /{SCORES_PATH}, returning a JSON "
-            "array of saved entries with player and score, and POST to the same path "
-            "to save an earned round result. "
-            f"Use integer workshop scores from 0 to {MAX_SCORE}, higher is better. "
-            "Explain how actual play earns that score and what the top of the scale "
-            "means; keep the displayed, stored, and reported values consistent. "
+            "modes, and audio for a later follow-up change. "
+            "Explain how actual play earns this game's score. Keep displayed and "
+            "saved results consistent. Store scores durably in the game service "
+            "so they survive a restart. "
             "Within this baseline, choose the gameplay and presentation."),
+    },
+    # PART 4's build: the room's game again, as a TEAM. Two capabilities, so Claude Code
+    # builds the service and Codex the page, one pull request each, and Kiro checks both.
+    # It names outcomes only. "One command starts the whole game" is what the event
+    # gallery runs; the planner decides how the two halves meet.
+    "team-game": {
+        "title": "Build a game with a shared leaderboard (front and back)",
+        "needs": ["backend", "frontend"],
+        "task": (
+            "Build a compact browser game with a shared leaderboard that a whole room "
+            "could play. One short, complete round around one core mechanic, with clear "
+            "controls, a meaningful earned score, a clear end state, and restart. The "
+            "leaderboard keeps names and scores durably so they survive a restart, and "
+            "refuses an empty name or an impossible score with a clear error. One "
+            "foreground command starts the whole game, page and leaderboard together. "
+            "Choose the concept and the look; give this team's game its own character."),
     },
     "service-from-scratch": {
         "title": "Build an HTTP API (backend only)",
@@ -386,3 +399,27 @@ def public_presets() -> list[dict[str, Any]]:
              "roles": _ordered(_resolve_needs(spec)),
              "task": spec["task"], "read_only": bool(spec.get("read_only"))}
             for pid, spec in PRESETS.items()]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Print the served team and how each named preset routes. Read-only, no model:
+    a preset declares capabilities, so routing it needs no model turn."""
+    import sys  # noqa: PLC0415
+    names = (sys.argv[1:] if argv is None else argv) or ["web-app", "game-from-scratch"]
+    print("The team this deployment serves (orchestrator/roles.py, or WORKSHOP_ROLES):")
+    for role in _roles.roster():
+        print(f"  {role.id:<22} {role.kind:<8} {role.capability}")
+    print("\nRoutes (a preset asks for capabilities, never for an agent):")
+    for name in names:
+        try:
+            route = resolve(preset=name)
+        except RouteError as exc:
+            print(f"  {name:<20} {exc}")
+            continue
+        needs = ", ".join(PRESETS[name].get("needs") or []) or "no builder"
+        print(f"  {name:<20} needs {needs:<20} -> {', '.join(route.agents)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
