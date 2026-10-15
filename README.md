@@ -1,197 +1,219 @@
-# Coding Agents on Amazon Bedrock AgentCore Runtime
+<div align="center">
 
-Run Claude Code (backend), Codex (frontend), and Kiro (validator) on Amazon
-Bedrock AgentCore Runtime. Give the team one request; the coordinator opens a
-checked and reviewed pull request for each selected builder. The guided game selects Claude Code
-and Kiro, producing one builder PR. A separate Claude Code validator remains a
-restore path: deploy and wire it, then select it with `WORKSHOP_ROLES`.
-opencode remains the alternate frontend, selected the same way.
+# Coding Agents on Amazon Bedrock AgentCore
 
-The backend defaults to **Claude Opus 5** (`us.anthropic.claude-opus-5`) with
-`high` effort. Codex uses **GPT-5.6 Sol** (`us.openai.gpt-5.6-sol`) with
-`medium` reasoning through the native Bedrock Runtime provider. The stack's
-`BackendModelId` and `FrontendModelId` parameters select different models when
-needed. Model access depends on the account; verify a complete tool turn in
-Lab 1 before starting a build.
+**Your coding agent, without your laptop's limits.**
 
-The game preset leaves its concept, appearance, controls, and progression to the
-builder. Teams share a small score interface: `GET /api/scores` returns saved
-`player`/`score` entries, `POST /api/scores` saves an earned result, and workshop
-scores run from 0 to 1000. Each game explains its own mapping to that scale.
-To add a creative direction in Chat, send
-`Use preset=game-from-scratch. Creative direction: <your own idea>`.
-The reporter sends the saved score unchanged; the shared board does not make
-different games equally difficult.
+It keeps working when you close the lid, it runs twenty at once,<br>
+it wakes up on its own when your repository changes,<br>
+and it works in a team where the maker is never the checker.
 
-Each builder works in a named linked Git worktree and separate pull request. The
-worktree is local to the coordinator or Runtime; only one normalized source archive
-crosses the Runtime boundary. The validator writes an executable for that request,
-and the orchestrator runs it. One independent,
-read-only review then applies two required lenses to each pull request on its own:
-adversarial verification and design/integration. The reviewer never sees a
-builder's conversation or edits a builder's code.
+[Get started](#get-started) · [The four labs](#the-four-labs) · [How the team works](#how-the-team-checks-its-own-work) · [Operator notes](docs/operators.md)
 
-This repo is the full code payload. Clone it and follow the workshop content.
-Labs 1 and 2 use the prepared host terminal. After playing the generated game,
-Lab 3 uses Chat to request a focused improvement, then Development, Agents, and
-Governance to follow its identity and usage. Participants review the PR and play
-the merged fix. The underlying commands and query remain inspectable.
+<sub>The code behind the AWS re:Invent 2026 workshop <b>AIM416: Scale your coding agents beyond the laptop with AgentCore</b></sub>
 
-> **Current project-language support:** Python and Node.js 22
-> (JavaScript/TypeScript). Add the required toolchain to
-> `orchestrator-agent/Dockerfile` before using another language, because that
-> container executes the validator's check.
+</div>
 
-This repository is the single source of truth for all demo and harness **code**. The
-matching Workshop Studio teaching content (guided lab pages and the CloudFormation
-template) is published on Workshop Studio; the CloudFormation bootstrap clones this
-repository directly into the box home, so the customer-reproducible path is exactly a
-`git clone` of this URL (which yields `~/sample-amazon-bedrock-agentcore-coding-agents`)
-followed by the CLI steps the workshop teaches.
+## Why this exists
 
-In Lab 2, create a separate **private GitHub repository** for the app your agents
-will build. Choose **No template** and turn **Add README** on so it has an initial
-commit and default branch. This platform repository stays in the workshop's VS Code
-checkout. The coordinator opens one role pull request per builder against the app
-repository's default branch, and each pull request is checked and reviewed
-on its own. Under the default `human_review` policy, an approved PR stays open
-for a person to merge. There is no combined candidate, merge queue, or separate final
-pull request. The validator's executable must pass for each pull request, run
-against the default branch as it stands plus that diff. The GitHub App authors every
-pull request.
+Claude Code, Codex, and Kiro feel best in your own terminal, and that terminal is
+the limit. The agent stops when the laptop sleeps, runs one task at a time, and
+waits for you to type, and it grades its own work. Amazon Bedrock AgentCore Runtime
+gives every session its own microVM, so the same agent can outlive the laptop, run in
+parallel, start from an event, and work beside agents from other vendors that check
+it. This repository is a complete, working example.
 
-A single builder receives the original request and chooses its design. Several
-builders begin independently from a shared interface plan. Because each pull request is
-checked and reviewed against the default branch AS IT STANDS, once an earlier role's
-pull request merges the next role's check runs against a tree that already contains
-it. When that merge moves a path a still-open pull request also changed, its owner
-gets one bounded refresh. This catches cases where separate branches each worked but
-did not agree with each other. It is separate from the one repair allowed after a
-failed check or review finding.
+## The four labs
 
-A repair re-runs the original executable. Its SHA-256 is recorded with each gate
-result and on the pull request, so reviewers can compare the evidence across
-rounds. Only a change to the default branch's source snapshot invalidates that
-check. If triage finds a fault in the check itself, the run stops for a person.
-For example, a document parser can miss a valid example because it pairs code
-fences incorrectly. Checker steering requires positive and negative parser
-controls; a checking failure must not be reported as missing application behavior.
-An operator correction is separate evidence, with its own check hash and review.
-The full executable is saved under its digest, locally and in the workshop bucket
-when available. The PR comment records the private S3 URI after that write succeeds,
-so the original check can be retrieved after its Runtime session ends.
-
-The executable runs in its own local Git checkout. `workshop-base` records the
-current default-branch snapshot and `HEAD` records the candidate source. These
-are local snapshot commits, not GitHub commit IDs. Git commands issued by the
-check therefore inspect the deliverable rather than the surrounding platform
-checkout.
-
-Lab 2 deliberately keeps Git metadata off S3 Files. The deployed coordinator uses
-`/tmp/workshop-runs`, each coding-agent Runtime creates its turn's worktree under
-`/tmp`, and `.git` never enters the exchange archive. S3 Files remains the shared
-workspace for direct shell work in Lab 1. The host, deployed coordinator, and
-run-state reader use the bucket recorded in `coding-agents/infra.config`, including
-stack-specific bucket names; `WORKSHOP_RUNTIME_BUCKET` remains an explicit override.
-
-## Layout
-
-- `coding-agents/` the three coding-agent harnesses (container + setup.sh + deploy.py + connect.py) and shared infra/gateway
-  - `claude-code/` backend builder (Claude Code, native Bedrock, Opus 5/high)
-  - `codex/` frontend builder (Codex 0.155.1, Bedrock Runtime Responses, Sol/medium)
-  - `kiro/` acceptance-contract validator (Kiro CLI; steered by `.kiro/steering/*.md` with `inclusion: always`, which directs it to author an executable check whose exit code is the gate; authenticates with your own `ksk_` key, fetched from the AgentCore Identity Token Vault at session start)
-  - `opencode/` alternate frontend (hidden; restore with `WORKSHOP_ROLES=claude-code,opencode,kiro`)
-  - `claude-code-validator/` alternate checker (hidden; restore with `WORKSHOP_ROLES=claude-code,codex,claude-code-validator`): the same acceptance-check-authoring contract in a `CLAUDE.md`, Bedrock-native with no key, for an account without a Kiro subscription
-- `orchestrator/` the Strands orchestrator engine (routing, engine, executor, reviewer, github)
-  - `orchestrator/roles.py` declares the served roster (`WORKSHOP_ROLES`-configurable); this is the single place role ids, kinds (builder/checker), and capabilities (backend/frontend/validator) live
-- `orchestrator-agent/` the deployable Strands agent bundle
-- `console/` the React + FastAPI console (Development / Agents / Chat / Governance / Settings)
-- `interactive-api/` `metrics-api/` the Stage 1 interactive + Stage 3 metrics engines
-- `harness-skills/` agent skills used to configure the harnesses
-- `e2e/` the end-to-end workshop journey + integration suite
-
-## Tests
-
-The full suite is collected from this repo root:
+**Lab 1. Run Claude Code on AgentCore Runtime.** Build Claude Code's image, create its
+Runtime in the AgentCore console (**Create runtime**, an ECR image, **Create default
+role**, an S3 Files mount), and open a terminal inside a new session, a microVM of its
+own. Give it a task, press **Ctrl+]** to disconnect, and reconnect later to the same
+conversation with the work done. Files live on the S3 Files mount, so they outlive the
+session. The image's
+health server (`coding-agents/healthcheck.py`) answers `/ping` with `HealthyBusy` while
+the agent CLI runs, which keeps the session alive while you are disconnected; once the
+CLI exits, the idle timeout applies.
 
 ```bash
-WORKSHOP_SKIP_LIVE=1 WORKSHOP_E2E_LIVE=0 python3 -m pytest -q
-npm --prefix console/web run typecheck
-npm --prefix console/web test
-npm --prefix console/web run build
+docker buildx bake claude-code --push      # REGISTRY=<account>.dkr.ecr.<region>.amazonaws.com
+agentcore exec --it --runtime "$ARN" --session-id "$(cat /proc/sys/kernel/random/uuid)"
 ```
 
-`pytest.ini` declares the `testpaths`; the root `conftest.py` isolates GitHub and
-Runtime credentials so no test can read a token or open a pull request.
-The offline suite verifies platform behavior, not a future agent-generated
-application. A fresh event run still needs its real executable and review
-evidence. Known console submitters are mapped to telemetry by default. Lab 3
-verifies that mapping and the exported usage events from Claude Code and Codex,
-shown separately for each user. CLI requests without user metadata and previously
-unlabeled events remain unattributed. Codex's input total includes cache tokens;
-the API normalizes both CLI formats without counting that cache twice. Missing
-measurements remain unavailable. Kiro credits and coordinator SDK usage are
-outside this CloudWatch query.
-
-## When something is not working
-
-Both collect no credentials and are safe to re-run:
+**Lab 2. Run Many Agents in Parallel.** Twenty Claude Code agents work on one
+repository at once, the way you run parallel agents on a laptop: one branch and one
+Git worktree per agent (`claude -w <name>`). Here each agent is a new session, so each
+worktree is on its own isolated microVM. You check the isolation by hand first: a note
+written in session A cannot be read from session B. `fanout.py --init` makes your Lab 1
+game a Git repository with a backlog of feature ideas and pushes it to a bare repository
+on the S3 Files mount, the only Git data there. Each session clones it to its own disk,
+runs `claude -w feature-NN` on one backlog item, and pushes that one branch. The host
+checks every branch out as a worktree under `~/arcade`, where you play them and merge the
+one you like. One rule committed to `CLAUDE.md` on `main` reaches every agent.
 
 ```bash
-python3 orchestrator/github.py doctor   # can the GitHub App reach YOUR repo?
-python3 orchestrator/diagnose.py        # roles wired, gateway, recent verdicts
-python3 orchestrator/diagnose.py <run_id>   # + that run's engine-log tail
+agentcore exec --runtime "$ARN" --session-id "$A" "sh -c 'echo hi > /tmp/note'"
+agentcore exec --runtime "$ARN" --session-id "$B" "cat /tmp/note"   # No such file
+python3 coding-agents/fanout.py --init && python3 coding-agents/fanout.py --agents 20
+python3 coding-agents/fanout.py --repo ~/your-repo --init   # then --repo ~/your-repo --task "... {n} ..."
 ```
 
-Run `doctor` BEFORE deploying the coordinator. The mistakes that cost the most time
-(an App installed on a different repository, a wrong owner in `GITHUB_REPO`) all pass
-a plain gateway health check and then fail when a build tries to write, after the
-agents have already run. `diagnose.py` invokes the same GitHub doctor check.
-To prove write permission, that check idempotently resets the
-`workshop/doctor` branch; it writes no file and opens no pull request.
+**Lab 3. Run an Agent on Every Pull Request.** Connect a GitHub repository and open a
+pull request. GitHub's
+event reaches the endpoint you deploy, which checks its signature, acts on each signed
+event once within an hour, and starts a new session that reviews the change, runs the
+code to prove what it finds, and posts the review on the pull request. Only pull
+requests from people the repository trusts are reviewed, because the review runs the
+code. Add `REVIEW.md` to the default branch to set your team's rules; comment
+`/fix` and a fixer session opens a fix pull request that a different session
+reviews. No agent ever holds a GitHub token: every write goes through AgentCore
+Gateway.
 
-Every finished run also persists its verdict, so `run_status <run_id>` still answers
-from a NEW coordinator session, and `list_runs` finds it when the run id is lost.
+```bash
+aws cloudformation deploy --template-file /tmp/pr-review.yaml --stack-name coding-agents-pr-review \
+  --capabilities CAPABILITY_NAMED_IAM   # after cloudformation package of coding-agents/pr_review/template.yaml
+./connect-github.sh owner/repository   # two clicks on GitHub: Create, Install
+```
 
-## Gotchas worth knowing before you debug
+The reviewer is one file, [`coding-agents/pr_review/handler.py`](coding-agents/pr_review/handler.py);
+its prompt is where your team's checklist goes.
 
-Each of these cost real time on a live run, and each has a cheap tell.
+**Lab 4. Build with a Team of Agents.** The same Runtime pattern serves Codex and Kiro,
+and a coordinator in its own Runtime turns them into a team. One request: Claude Code builds
+the service and Codex the page, one pull request each; Kiro writes and runs a check
+for each; an independent review reads each; a red result goes back to its builder
+once. Green, approved work merges in order, and anything still red waits for you.
 
-- **The opencode restore path needs a pseudo-terminal.** Version 1.17.20's default formatter blocks when
-  stdout is not a tty, so a non-PTY invocation hangs with no output, no error and almost
-  no CPU, its debug log stopping right after `init`. Its supported paths run it in a
-  PTY (`agentcore exec --it`, and a Runtime PTY per dispatched turn). Preserve
-  that PTY when restoring it.
-- **A closed shell is not a successful command.** Read the Runtime's termination
-  status, including a non-zero `ExitCode` cause. A connection that closes without
-  a command result reports an execution error.
-- **Browser input needs browser evidence.** A passing service check does not prove
-  that global keyboard shortcuts leave form fields usable, or that repeated
-  Enter sends only one request. Exercise the actual interaction and inspect
-  the complete event-handler path before approving a UI change.
-- **Enabling Claude Code telemetry is not exporting it.** A dispatched run gets seven
-  variables from `_CLAUDE_TELEMETRY` in `orchestrator/roles.py`. With only
-  `CLAUDE_CODE_ENABLE_TELEMETRY=1` the CLI collects and sends nowhere, and Logs Insights
-  stays empty. Check the sidecar too: inside the Runtime,
-  `curl -fsS http://127.0.0.1:13133` answers `"status":"Server available"`.
-- **Only stage steering a role actually reads.** Every mounted role can read
-  `/mnt/s3files`. In a hand-opened shell, Claude Code stays in `$HOME` and reads
-  its baked `CLAUDE.md`; Codex uses `/mnt/s3files` when the mount is attached.
-  Kiro copies only `.kiro/steering/validator.md` from the mount into its private
-  `$HOME` and starts there, keeping the frontend's `AGENTS.md` out of its context.
-  Kiro uses an explicit `WORKSHOP_AGENT_WORKDIR` when one is provided for dispatched work.
-- **A session id must be at least 33 characters**, which is why every example generates a
-  UUID. And `.bashrc` exports reach interactive shells only, so scripted runs must pass
-  the environment explicitly.
-- **Trust the pull request, not the chat turn.** The coordinator's prose is a model
-  summarising state and can overstate; `role_prs`, `gate_history`, `review_rounds`,
-  `fail_reason` and `next_action` are what the engine recorded.
-- **You cannot create a GitHub App from an API.** `coding-agents/gateway_mcp/create-github-app.py`
-  automates everything around it (manifest, redirect, conversion, installation id
-  discovery), but a human still presses **Create GitHub App** and installs it. Adding a
-  new repository to an App installation you own also needs a browser: a user token gets
-  `403 You do not have permission to modify this app`.
+```bash
+cd orchestrator-agent
+WORKSHOP_MERGE_POLICY=auto ./deploy-coordinator.sh   # wired to the three Runtimes and your repository
+./ask.sh "Use preset=team-game. Creative direction: <your idea>"   # then: python3 ../orchestrator/watch_run.py
+```
+
+## How the team checks its own work
+
+You ask for a change and get back pull requests that a separate agent tested and an
+independent review read.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/demo-poster.png">
+    <source type="image/webp" srcset="docs/assets/demo.webp">
+    <img src="docs/assets/demo-poster.png" width="880" alt="Agent Studio during one live workshop event: a play-test report is typed into Chat, the coordinator reads the repository and dispatches Codex, Codex fixes the game live in its own AgentCore Runtime session, Kiro writes an executable check, the pull request shows the passing check and the independent review, the fixed game is played, and Usage shows tokens by agent and by person.">
+  </picture>
+</p>
+<p align="center"><sub>Real screens from one live workshop event, in loop order. Nothing is mocked.</sub></p>
+
+**Discover → Plan → Execute → Verify → Iterate.** A loop is only as good as its
+verify step, so every choice here protects it.
+
+- **The maker is never the checker.** Builders write code. A different agent, in its
+  own Runtime with its own instructions, decides whether it works.
+- **Verification is real execution.** The checker writes an executable test for
+  *your* request. The engine runs it and reads the exit code. A red check never
+  turns green, and no result is ever faked.
+- **Bounded, then a human.** A failed check goes back to the builder that owns it
+  once, on the same pull request. Then the loop stops and hands you the evidence.
+- **Skills, not scripts.** Agents read principle-based skills and choose their own
+  files, language, and structure. Nothing in this repository encodes the answer.
+
+<p align="center"><img src="docs/assets/how-it-works.svg" width="100%" alt="Build row: you ask, the coordinator on AgentCore Runtime plans and routes, Claude Code and Codex build in their own Runtimes, and each opens one pull request through AgentCore Gateway. Verify row: Kiro writes a check in its own Runtime, the engine runs it for real, an independent review tries to break it, and you merge. A red check goes back to its builder once, then to you."></p>
+
+## Agent Studio
+
+A browser console for the whole loop, included in [`console/`](console). The core
+workshop uses the terminal; the Agent Studio track brings the same work into a
+browser, with usage and controls per person.
+
+| Workspace | Governance |
+|---|---|
+| **Chat** · ask, plan, and follow each build to its pull request | **Usage** · token usage by agent and by person, from CloudWatch |
+| **Agents** · open a live terminal in any agent's Runtime session, or watch the one Chat started | **Controls** · identity, role boundaries, merge policy, and a policy checker |
+| **Development** · edit files and run commands on the workshop host | **Activity** · an audit trail of decisions, and every Runtime session |
+
+<details>
+<summary><b>See more screens</b></summary>
+<br>
+
+**Development.** The workshop host in your browser: files, editor, and a terminal.
+
+<img src="docs/assets/screens/development.webp" alt="Agent Studio Development page with the repository tree and a terminal showing five passing identity tests">
+
+**Controls.** Who is signed in, who checks the work, the merge and repair limits, and a policy check that blocked a write without running it.
+
+<img src="docs/assets/screens/controls.webp" alt="Agent Studio Controls page showing a teammate signed in, human-review merging, Kiro as checker, one repair per pull request, and a policy preview blocked by the read-only workflow rule">
+
+**Activity.** The audit record for that decision: who, which rule, and that nothing was executed.
+
+<img src="docs/assets/screens/activity.webp" alt="Agent Studio Activity page with the audit event for the blocked policy preview">
+
+**Event gallery.** Teams publish what their agents built so the room can play it.
+
+<img src="docs/assets/screens/arcade.webp" alt="The workshop's AgentCore Arcade gallery with a shared team game and a Play Game button">
+
+</details>
+
+## Get started
+
+**At AWS re:Invent 2026 (AIM416) or another AWS event:** your account and a
+browser-based VS Code are ready, with an empty home folder. Open the workshop and start
+with Getting Started (At an AWS Guided Event), where you clone this repository at the
+commit the workshop was tested with:
+
+```bash
+git clone --depth 1 --revision <commit> https://github.com/aws-samples/sample-amazon-bedrock-agentcore-coding-agents.git
+cd sample-amazon-bedrock-agentcore-coding-agents && coding-agents/infra/setup.sh
+```
+
+**In your own AWS account:** launch the workshop stack in one region, then follow
+the same pages. You need Amazon Bedrock access to Claude Sonnet 5, and a GitHub account
+for Labs 3 and 4.
+
+<p>
+  <a href="https://us-west-2.console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/create/review?templateURL=https://ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0.s3.us-west-2.amazonaws.com/7b1cc169-b7a2-4a64-b215-df050bd8c8f1/cfn.yaml&stackName=coding-agents-workshop&param_AssetsBucketName=ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0&param_AssetsBucketPrefix=7b1cc169-b7a2-4a64-b215-df050bd8c8f1"><img src="docs/assets/launch-stack.svg" alt="Launch Stack"></a>&nbsp; US West (Oregon), recommended<br>
+  <a href="https://us-east-1.console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?templateURL=https://ws-assets-prod-iad-r-iad-ed304a55c2ca1aee.s3.us-east-1.amazonaws.com/7b1cc169-b7a2-4a64-b215-df050bd8c8f1/cfn.yaml&stackName=coding-agents-workshop&param_AssetsBucketName=ws-assets-prod-iad-r-iad-ed304a55c2ca1aee&param_AssetsBucketPrefix=7b1cc169-b7a2-4a64-b215-df050bd8c8f1"><img src="docs/assets/launch-stack.svg" alt="Launch Stack"></a>&nbsp; US East (N. Virginia)
+</p>
+
+| Lab | You do | You learn |
+|---|---|---|
+| **Lab 1. Run Claude Code on AgentCore Runtime** | Build Claude Code's image, create its Runtime, give it a task, disconnect, reconnect | A session is a microVM in the cloud, so it keeps running after you disconnect |
+| **Lab 2. Run Many Agents in Parallel** | Run twenty agents on one repository, a branch and worktree each, then merge the one you like | Each new session is a new isolated microVM, so running more agents is a loop over session IDs |
+| **Lab 3. Run an Agent on Every Pull Request** | Deploy the endpoint, connect a repository, open a pull request | A GitHub event can start a session, and the agent never holds a GitHub token |
+| **Lab 4. Build with a Team of Agents** | Set up Kiro, then send one request to a coordinator | A separate agent writes the check, its exit code decides, and a person merges |
+
+Lost at any point? One read-only command says where you are and what to run next:
+
+```bash
+python3 orchestrator/progress.py
+```
+
+When you finish, `aws bedrock-agentcore stop-runtime-session` ends your session. In your own account,
+follow the workshop's cleanup steps: the host, Runtimes, Gateway, and NAT gateway
+are billed while they exist.
+
+## What's in the repository
+
+| Folder | What it holds |
+|---|---|
+| [`coding-agents/`](coding-agents) | One folder per agent (container, steering, deploy), `fanout.py`, the pull request reviewer and its template, and the GitHub Gateway |
+| [`orchestrator/`](orchestrator) | The loop: routing, dispatch, checks, review, GitHub, and saved run records |
+| [`orchestrator-agent/`](orchestrator-agent) | The coordinator, packaged for AgentCore Runtime |
+| [`console/`](console) | Agent Studio (React and FastAPI) |
+| [`harness-skills/`](harness-skills) | The skills each agent reads |
+| [`interactive-api/`](interactive-api), [`metrics-api/`](metrics-api) | Terminal sessions and usage queries behind the console |
+| [`e2e/`](e2e) | Journey and integration tests |
+
+Pins, tests, troubleshooting, and hard-won gotchas are in
+[docs/operators.md](docs/operators.md).
+
+## Security
+
+This is sample code for learning. Agent Studio is an example UI, not an AWS
+service. Review IAM scope, networking, and data handling before using any of it
+in production. To report a security issue, use
+[AWS vulnerability reporting](https://aws.amazon.com/security/vulnerability-reporting/)
+rather than a public issue. See [CONTRIBUTING](CONTRIBUTING.md).
 
 ## License
 
-MIT-0. See `LICENSE`.
+MIT-0. See [LICENSE](LICENSE).

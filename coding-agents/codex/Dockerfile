@@ -1,11 +1,21 @@
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023
+# Built with named contexts: docker buildx bake <role>, from the repository root (docker-bake.hcl).
+ARG WORKSHOP_RUNTIME_BASE_IMAGE=public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:06da5a3362eda00c5114227ac81abe56dd9b943395553b7c64a310457f4d9e2b
+FROM ${WORKSHOP_RUNTIME_BASE_IMAGE}
 
 RUN dnf install -y --allowerasing \
-    git curl python3 python3-pip jq tar gzip nodejs npm which findutils awscli \
-    && dnf clean all
+    git curl python3.13 python3.13-pip jq tar gzip nodejs22 nodejs22-npm \
+    openssl-snapsafe-libs which findutils awscli \
+    && dnf clean all \
+    && ln -s /usr/bin/node-22 /usr/local/bin/node \
+    && ln -s /usr/bin/npm-22 /usr/local/bin/npm \
+    && ln -s /usr/bin/npx-22 /usr/local/bin/npx \
+    && python3.13 -m venv /opt/workshop-python
+ENV PATH="/opt/workshop-python/bin:/usr/local/bin:${PATH}"
+RUN node --version && npm --version && npx --version && python3 --version \
+    && python3 -c 'import ssl; print(ssl.OPENSSL_VERSION)' \
+    && rpm -q openssl-snapsafe-libs
 
-# This version includes the Bedrock Runtime Responses provider.
-RUN npm install -g @openai/codex@0.155.1 typescript ts-node
+RUN npm install -g typescript ts-node
 
 # Same pinned ARM64 collector as the other workshop Runtime images.
 ARG OTELCOL_VERSION=0.116.1
@@ -17,15 +27,19 @@ RUN curl -fsSL -o /tmp/otelcol.tar.gz \
 
 RUN useradd -m -d /home/agent -u 1000 agent
 
+COPY --from=toolchain cli-versions.json cli_versions.py /opt/workshop-cli/
+RUN python3 /opt/workshop-cli/cli_versions.py install --cli codex \
+      --home /home/agent --user agent --receipt /opt/workshop-cli/installed.json
+
 # boto3 supports AWS diagnostics. Codex authenticates to Bedrock
 # through the runtime role's normal AWS SDK credential chain.
-RUN pip3 install --quiet boto3
+RUN python3 -m pip install --quiet $(python3 /opt/workshop-cli/cli_versions.py sdk-requirements)
 
 # Startup writes the actual region before either run.sh or direct dispatch runs.
 RUN mkdir -p /home/agent/.codex && chown -R agent:agent /home/agent/.codex
 COPY --chown=agent:agent .codex/config.toml /home/agent/.codex/config.toml
 
-COPY --chown=agent:agent healthcheck.py /app/healthcheck.py
+COPY --chown=agent:agent --from=toolchain healthcheck.py /app/healthcheck.py
 COPY configure_codex.py /app/configure_codex.py
 COPY entrypoint.sh /app/entrypoint.sh
 COPY otel-collector-config.yaml /app/otel-collector-config.yaml
@@ -54,4 +68,5 @@ EXPOSE 8080
 USER agent
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["python3", "/app/healthcheck.py"]
+# /ping: HealthyBusy while the agent CLI runs, so a detached session keeps working.
+CMD ["python3", "/app/healthcheck.py", "--agent", "codex", "--busy", "codex"]

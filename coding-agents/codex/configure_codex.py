@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 
-DEFAULT_MODEL = "us.openai.gpt-5.6-sol"
+DEFAULT_MODEL = "global.openai.gpt-5.6-sol"
 PROVIDER = "amazon-bedrock-runtime"
 
 
@@ -39,10 +39,12 @@ def render_config(region, model, workdirs=()):
         f"model = {quote(model)}\n"
         f"model_provider = {quote(PROVIDER)}\n"
         'model_reasoning_effort = "medium"\n'
+        'check_for_update_on_startup = false\n'
         '\n[otel]\n'
         'environment = "workshop"\n'
         'log_user_prompt = false\n'
         'exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/logs", protocol = "binary" } }\n'
+        'metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/metrics", protocol = "binary" } }\n'
         'trace_exporter = "none"\n'
         f"\n[model_providers.{PROVIDER}.aws]\n"
         f"region = {quote(region)}\n"

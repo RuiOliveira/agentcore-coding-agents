@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadKiroKeyThroughTheTokenVault",
+      "Effect": "Allow",
+      "Action": ["bedrock-agentcore:GetWorkloadAccessToken", "bedrock-agentcore:GetResourceApiKey"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "OnlyIdentityManagedSecrets",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:*:*:secret:bedrock-agentcore-identity*"
+    }
+  ]
+}

@@ -13,10 +13,23 @@
 #                      then a separate `finch push`.
 #
 # Usage (sourced or called):
-#   build_and_push_arm64 "<ECR_URI>" "<DOCKERFILE>" "<BUILD_CONTEXT>" "<REGION>" "<ACCOUNT_ID>"
-build_and_push_arm64() {
+#   build_and_push_arm64 "<ECR_URI>" "<DOCKERFILE>" "<BUILD_CONTEXT>" "<REGION>" "<ACCOUNT_ID>" [--toolchain]
+build_and_push_arm64() (
   local ecr_uri="$1" dockerfile="$2" context="$3" region="$4" account_id="$5"
   local registry="${account_id}.dkr.ecr.${region}.amazonaws.com"
+  local -a build_options=(--platform linux/arm64)
+
+  if [ -n "${6:-}" ]; then
+    [ "$6" = "--toolchain" ] || { echo "Unknown build option: $6" >&2; return 2; }
+    local tools_dir
+    tools_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # The same named contexts docker-bake.hcl declares: the pinned toolchain and the
+    # builders' skills. The role's .dockerignore keeps local state and secrets out of
+    # its context, and only the Dockerfile's explicit COPY lines reach the image.
+    build_options+=(--build-context "toolchain=${tools_dir}"
+                    --build-context "skills=${tools_dir}/../harness-skills/skills")
+    build_options+=(--build-arg "WORKSHOP_RUNTIME_BASE_IMAGE=$(python3 "${tools_dir}/cli_versions.py" get runtime.base_image)")
+  fi
 
   # Pick a real builder: prefer docker+buildx, fall back to finch. A box with
   # neither fails loud (no silent skip); there is no fake "pretend it built".
@@ -43,7 +56,7 @@ build_and_push_arm64() {
   echo "Building arm64 image: ${ecr_uri}"
   if [ "$builder" = "docker-buildx" ]; then
     docker buildx build \
-      --platform linux/arm64 \
+      "${build_options[@]}" \
       -t "${ecr_uri}" \
       -f "${dockerfile}" \
       "${context}" \
@@ -51,7 +64,7 @@ build_and_push_arm64() {
   else
     # Finch: build then push (no single-step --push).
     finch build \
-      --platform linux/arm64 \
+      "${build_options[@]}" \
       -t "${ecr_uri}" \
       -f "${dockerfile}" \
       "${context}"
@@ -59,4 +72,4 @@ build_and_push_arm64() {
   fi
 
   echo "Image pushed: ${ecr_uri}"
-}
+)

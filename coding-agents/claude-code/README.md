@@ -21,7 +21,7 @@ python deploy.py
 
 `deploy.py` writes the Runtime ARN to `runtime_config.json`.
 
-The backend defaults to `us.anthropic.claude-opus-5` with `high` effort. To
+The backend defaults to `global.anthropic.claude-sonnet-5` with `low` effort. To
 change either setting, export `WORKSHOP_CLAUDE_MODEL` or
 `WORKSHOP_CLAUDE_EFFORT` before running `deploy.py`; the settings are forwarded
 to the Runtime. Use the same exports when configuring the coordinator.
@@ -32,6 +32,11 @@ For model selection, an explicit launcher `--model` wins, followed by
 environment precedence. An explicit launcher `--effort` overrides
 `WORKSHOP_CLAUDE_EFFORT`; setting that variable to an empty string omits the
 CLI flag.
+
+Headless runs do not impose a CLI turn-count limit. Orchestrated work keeps
+the `HARNESS_ROLE_TIMEOUT_S` wall-clock deadline and the existing per-pull-request
+repair bound. A recorded failure remains a failure and is never automatically
+resubmitted merely because a CLI limit was reached.
 
 ## Open a shell
 

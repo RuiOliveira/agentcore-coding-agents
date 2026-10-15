@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import uuid
 from contextlib import contextmanager
@@ -436,13 +437,47 @@ def tree_digest(root: str,
     return h.hexdigest()
 
 
+def _gitignored(root: str, paths: list[str]) -> set[str]:
+    """The paths that ``root``'s own .gitignore files ignore, asked of Git itself.
+
+    Uses a throwaway repository pointed at ``root`` as its work tree, with the user's
+    and the system's Git configuration switched off, so only the ignore files inside
+    the tree decide. A Git failure raises: a patch must never silently grow or shrink.
+    """
+    if not paths:
+        return set()
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    with tempfile.TemporaryDirectory(prefix="workshop-ignore-") as scratch:
+        subprocess.run(["git", "init", "-q", scratch], env=env, check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        done = subprocess.run(
+            ["git", f"--git-dir={os.path.join(scratch, '.git')}", f"--work-tree={root}",
+             "check-ignore", "--no-index", "--stdin", "-z"],
+            input="".join(f"{p}\0" for p in paths), cwd=root, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if done.returncode not in (0, 1):  # 1 = nothing ignored
+        raise RuntimeError(f"WORKTREE_GIT_ERROR: git check-ignore failed: "
+                           f"{(done.stderr or done.stdout).strip()}")
+    return {p for p in done.stdout.split("\0") if p}
+
+
 def diff_trees(item: WorkItem, base_root: str, work_root: str,
                *, exclude: Callable[[str], bool] | None = None) -> TreePatch:
-    """Compute additions, edits, and deletions from the base the role received."""
+    """Compute additions, edits, and deletions from the base the role received.
+
+    A NEW file that the work tree's own .gitignore ignores is not part of the change,
+    exactly as ``git add -A`` would leave it out: a builder that ignores ``dist/``
+    and then builds has not authored its bundle. A file the base already tracks
+    stays tracked even when it matches, as in Git. A live run shipped a 231 KB
+    minified bundle its own .gitignore excluded, and the review abstained on it.
+    """
     base = _tree_files(base_root, exclude)
     work = _tree_files(work_root, exclude)
+    ignored = _gitignored(work_root, sorted(set(work) - set(base)))
     changes: dict[str, bytes | None] = {}
     for path in sorted(set(base) | set(work)):
+        if path in ignored:
+            continue
         before = base.get(path, _MISSING)
         after = work.get(path, _MISSING)
         if before == after:

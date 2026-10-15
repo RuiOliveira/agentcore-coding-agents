@@ -23,6 +23,26 @@
 # ============================================================
 set -euo pipefail
 
+# AgentCore exec shells may omit the image's virtual environment from PATH.
+# Use its installed SDK; retain PATH-based Python for host/test invocations.
+KIRO_PYTHON="/opt/workshop-python/bin/python3"
+if [ ! -x "$KIRO_PYTHON" ]; then
+  KIRO_PYTHON=python3
+fi
+
+# Command shells can omit Runtime environment variables. Recover only Kiro's
+# named model controls, preserving explicit values, including an empty effort.
+for setting in WORKSHOP_KIRO_MODEL WORKSHOP_KIRO_EFFORT; do
+  if [ "${!setting+x}" != x ] && [ -r /proc/1/environ ]; then
+    while IFS= read -r -d '' entry; do
+      if [[ "$entry" == "$setting="* ]]; then
+        export "$entry"
+        break
+      fi
+    done < /proc/1/environ
+  fi
+done
+
 # Inherit env vars from PID 1 (container entrypoint) if not already set
 if [ -z "${GATEWAY_URL:-}" ] && [ -r /proc/1/environ ]; then
   GATEWAY_URL=$(cat /proc/1/environ | tr '\0' '\n' | grep ^GATEWAY_URL= | cut -d= -f2- || true)
@@ -68,7 +88,7 @@ CREDENTIAL_PROVIDER="${AGENTCORE_CREDENTIAL_PROVIDER:-kiro-api-key}"
 # branch below stays only as an escape hatch for a hand-run local test where an
 # operator exports it themselves; the shipped runtime never has it set.
 fetch_api_key() {
-  python3 -W ignore -c "
+  "$KIRO_PYTHON" -W ignore -c "
 import boto3, sys, warnings
 warnings.filterwarnings('ignore')
 
@@ -115,15 +135,25 @@ fi
 # leaving the checker on a router made it the only role whose model nobody chose.
 #
 # The id is kiro-cli's OWN vendor name, not a Bedrock inference profile: verified with
-# `kiro-cli chat --list-models` inside a live Runtime, which lists `claude-opus-5`
-# (2.20x credits, 1M context) alongside `auto`, `claude-sonnet-5`, `claude-opus-4.8`
-# and the rest. A Bedrock model id here would be silently rejected by the CLI.
-MODEL="${WORKSHOP_KIRO_MODEL:-claude-opus-5}"
+# `kiro-cli chat --list-models` inside a live Runtime, which lists `claude-opus-5.5`
+# (2.00x credits, 1M context, an experimental preview) alongside `auto`,
+# `claude-opus-5`, `claude-sonnet-5` and the rest. A Bedrock model id here would be
+# rejected by the CLI. Keep this default equal to orchestrator/roles.py.
+MODEL="${WORKSHOP_KIRO_MODEL:-claude-opus-5.5}"
+EFFORT="${WORKSHOP_KIRO_EFFORT-low}"
 REMAINING_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --model)
       MODEL="$2"
+      shift 2
+      ;;
+    --effort)
+      if [ "$#" -lt 2 ]; then
+        echo "Error: --effort requires a value" >&2
+        exit 2
+      fi
+      EFFORT="$2"
       shift 2
       ;;
     *)
@@ -132,19 +162,26 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
-set -- "${REMAINING_ARGS[@]}"
+# Bash 3 treats an empty array as unset under nounset. A bare launcher (or
+# model/effort options alone) still needs to open the interactive chat.
+set -- ${REMAINING_ARGS[@]+"${REMAINING_ARGS[@]}"}
+KIRO_CHAT_ARGS=(--trust-all-tools)
+case "$EFFORT" in
+  "") ;;
+  low|medium|high|xhigh|max) KIRO_CHAT_ARGS+=(--effort "$EFFORT") ;;
+  *)
+    echo "Error: WORKSHOP_KIRO_EFFORT must be low, medium, high, xhigh, max, or empty" >&2
+    exit 2
+    ;;
+esac
 
 mkdir -p "$HOME/.kiro/settings"
 # chat.disableTrustAllConfirmation suppresses the one-time interactive "Kiro is
 # running in trust all tools mode" acceptance prompt, so the headless PTY starts
 # straight into work instead of hanging on a "Yes, I accept" picker. Paired with
 # the `chat --trust-all-tools` launch below.
-cat > "$HOME/.kiro/settings/cli.json" <<EOF
-{
-  "chat.defaultModel": "${MODEL}",
-  "chat.disableTrustAllConfirmation": true
-}
-EOF
+"$KIRO_PYTHON" "${WORKSHOP_CLI_HELPER:-/opt/workshop-cli/cli_versions.py}" configure \
+  --cli kiro --home "$HOME" --kiro-model "$MODEL" >/dev/null
 
 # ── Determine the action ─────────────────────────────────────
 ACTION="${1:-interactive}"
@@ -197,10 +234,10 @@ fi
 # trusted INTERACTIVE TUI, so the validator runs straight through without prompts.
 case "$ACTION" in
   interactive)
-    exec kiro-cli chat --trust-all-tools
+    exec kiro-cli chat "${KIRO_CHAT_ARGS[@]}"
     ;;
   chat)
-    exec kiro-cli chat --no-interactive --trust-all-tools "$PROMPT"
+    exec kiro-cli chat --no-interactive "${KIRO_CHAT_ARGS[@]}" "$PROMPT"
     ;;
   *)
     exec kiro-cli "$ACTION" "$PROMPT"

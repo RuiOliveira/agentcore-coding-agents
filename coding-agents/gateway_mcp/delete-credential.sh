@@ -21,6 +21,8 @@ aws secretsmanager delete-secret \
   --secret-id "$SECRET_NAME" \
   --force-delete-without-recovery \
   --region "$AWS_REGION"
+aws secretsmanager delete-secret --secret-id agentcore/github-mcp/webhook \
+  --force-delete-without-recovery --region "$AWS_REGION" >/dev/null 2>&1 || true
 
 state_set "github_app_secret_arn" ""
 echo "==> GitHub App secret deleted."

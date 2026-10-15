@@ -1,8 +1,19 @@
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023
+# Built with named contexts: docker buildx bake <role>, from the repository root (docker-bake.hcl).
+ARG WORKSHOP_RUNTIME_BASE_IMAGE=public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:06da5a3362eda00c5114227ac81abe56dd9b943395553b7c64a310457f4d9e2b
+FROM ${WORKSHOP_RUNTIME_BASE_IMAGE}
 
 RUN dnf install -y --allowerasing \
-    git curl nodejs npm python3 python3-pip jq tar gzip unzip which findutils awscli \
-    && dnf clean all
+    git curl nodejs22 nodejs22-npm python3.13 python3.13-pip jq tar gzip unzip \
+    openssl-snapsafe-libs which findutils awscli \
+    && dnf clean all \
+    && ln -s /usr/bin/node-22 /usr/local/bin/node \
+    && ln -s /usr/bin/npm-22 /usr/local/bin/npm \
+    && ln -s /usr/bin/npx-22 /usr/local/bin/npx \
+    && python3.13 -m venv /opt/workshop-python
+ENV PATH="/opt/workshop-python/bin:/usr/local/bin:${PATH}"
+RUN node --version && npm --version && npx --version && python3 --version \
+    && python3 -c 'import ssl; print(ssl.OPENSSL_VERSION)' \
+    && rpm -q openssl-snapsafe-libs
 
 # OpenTelemetry collector sidecar (otelcol-contrib): baked in so entrypoint.sh can
 # start it at container boot and re-sign the agent's unsigned OTLP to CloudWatch
@@ -19,41 +30,19 @@ RUN npm install -g typescript ts-node
 # Non-root user
 RUN useradd -m -d /home/agent -u 1000 agent
 
-# Kiro CLI (installed as agent user so it lands in ~/.local/bin).
-#
-# This step FAILS THE BUILD when the CLI does not land, and that is the whole point
-# of its shape. It used to end `|| true` with nothing verifying the binary
-# afterwards, so a broken install produced a green image whose first symptom was an
-# unexplained nonzero exit on the attendee's first Lab 2 gate. The CFN bootstrap
-# treats this image as fail-loud, but its guard only checks that setup.sh exited
-# zero and that agent.config has an ECR_URI, neither of which notices an absent
-# kiro-cli. Same reasoning as the otelcol step above, which has always verified.
-#
-# Two properties are borrowed from the host install in static/aws/cfn.yaml, read out
-# of the vendor installer itself:
-#   * Downloaded to a FILE rather than piped into bash, so a truncated transfer
-#     fails on curl's exit code instead of executing half a script.
-#   * `--force` skips the installer's interactive pre-existing-binary prompt, which
-#     has no tty to read here.
-# The two probes are separate on purpose: `kiro-cli` alone is not enough, because
-# `kiro-cli chat` (the ONLY form run.sh and the orchestrator dispatch ever use)
-# re-execs the sibling `kiro-cli-chat`, and a missing sibling dies at run time with
-# "No such file or directory (os error 2)".
-USER agent
+# Verify the immutable archive before running its installer as the agent user.
+# Both kiro-cli and its re-executed chat sibling must report the pinned version.
+COPY --from=toolchain cli-versions.json cli_versions.py /opt/workshop-cli/
+RUN python3 /opt/workshop-cli/cli_versions.py install --cli kiro \
+      --home /home/agent --user agent --receipt /opt/workshop-cli/installed.json
 ENV HOME=/home/agent
-RUN curl -fsSL https://cli.kiro.dev/install -o /tmp/kiro-install.sh \
-    && bash /tmp/kiro-install.sh --force \
-    && rm -f /tmp/kiro-install.sh \
-    && "$HOME/.local/bin/kiro-cli" --version \
-    && test -x "$HOME/.local/bin/kiro-cli-chat"
-USER root
 
 # boto3 + awscurl for AgentCore Identity Token Vault and MCP tool calls. The AWS
 # CLI above is also required by orchestrator/runtime_exec.py for the Lab 2 source
 # archive download and result upload; the dispatched path bypasses run.sh.
-RUN pip3 install --quiet boto3 awscurl
+RUN python3 -m pip install --quiet awscurl $(python3 /opt/workshop-cli/cli_versions.py sdk-requirements)
 
-COPY --chown=agent:agent healthcheck.py /app/healthcheck.py
+COPY --chown=agent:agent --from=toolchain healthcheck.py /app/healthcheck.py
 COPY run.sh /app/run.sh
 COPY entrypoint.sh /app/entrypoint.sh
 COPY otel-collector-config.yaml /app/otel-collector-config.yaml
@@ -83,4 +72,5 @@ USER agent
 
 # entrypoint.sh starts the OTel collector at boot, then exec's the CMD.
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["python3", "/app/healthcheck.py"]
+# /ping: HealthyBusy while the agent CLI runs, so a detached session keeps working.
+CMD ["python3", "/app/healthcheck.py", "--agent", "kiro", "--busy", "kiro-cli", "--busy", "kiro-cli-chat"]

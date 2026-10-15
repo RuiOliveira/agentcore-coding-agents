@@ -24,7 +24,9 @@ import llm  # noqa: E402
 
 def test_resolve_passes_through_openai_ids():
     assert llm.resolve("openai.gpt-5.5") == "openai.gpt-5.5"
-    assert llm.resolve("claude-opus-4-6") == "us.anthropic.claude-opus-4-6-v1"
+    # Retired aliases resolve to the supported Global CRIS successor.
+    assert llm.resolve("claude-opus-4-6") == "global.anthropic.claude-sonnet-5"
+    assert llm.resolve("claude-sonnet-5") == "global.anthropic.claude-sonnet-5"
 
 
 def _http_error(code: int, body: bytes = b'{"error":{"message":"server error"}}'):
@@ -174,7 +176,7 @@ def test_openai_sibling_resolution(monkeypatch):
     monkeypatch.setattr(llm, "OPENAI_FALLBACK_MODEL", "openai.gpt-5.4")
     assert llm.openai_sibling("openai.gpt-5.5") == "openai.gpt-5.4"
     assert llm.openai_sibling("openai.gpt-5.4") is None         # already the sibling
-    assert llm.openai_sibling("us.anthropic.claude-opus-4-6-v1") is None  # not OpenAI
+    assert llm.openai_sibling("global.anthropic.claude-sonnet-5") is None  # not OpenAI
     monkeypatch.setattr(llm, "OPENAI_FALLBACK_MODEL", "")
     assert llm.openai_sibling("openai.gpt-5.5") is None          # fallback disabled
 
@@ -200,3 +202,31 @@ def test_openai_404_falls_back_to_sibling(monkeypatch):
     out = llm.invoke("openai.gpt-5.5", "Reply OK", max_tokens=64)
     assert out["model_id"] == "openai.gpt-5.4"
     assert calls == ["openai.gpt-5.5", "openai.gpt-5.4"]
+
+
+class _Converse:
+    def __init__(self, reject_effort=False):
+        self.calls, self.reject_effort = [], reject_effort
+
+    def converse(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.reject_effort and "additionalModelRequestFields" in kwargs:
+            raise RuntimeError("ValidationException: unsupported field")
+        return {"output": {"message": {"content": [{"text": "{}"}]}},
+                "usage": {"inputTokens": 1, "outputTokens": 1}}
+
+
+def test_plain_claude_calls_send_effort_and_retry_without_it(monkeypatch):
+    import boto3
+    client = _Converse()
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: client)
+    llm.invoke("global.anthropic.claude-sonnet-5", "hi", effort="low")
+    assert client.calls[0]["additionalModelRequestFields"] == {"output_config": {"effort": "low"}}
+    old = _Converse(reject_effort=True)
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: old)
+    assert llm.invoke("global.anthropic.claude-sonnet-5", "hi", effort="low")["text"] == "{}"
+    assert len(old.calls) == 2 and "additionalModelRequestFields" not in old.calls[1]
+    plain = _Converse()
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: plain)
+    llm.invoke("global.anthropic.claude-sonnet-5", "hi")
+    assert "additionalModelRequestFields" not in plain.calls[0]

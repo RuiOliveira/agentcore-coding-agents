@@ -37,7 +37,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tarfile
 import threading
 import time
@@ -56,9 +55,33 @@ _RUNS_DIR = os.environ.get("WORKSHOP_RUNS_DIR", os.path.join(_REPO_ROOT, ".runs"
 _SETTINGS = os.environ.get("WORKSHOP_GITHUB_SETTINGS",
                            os.path.join(_RUNS_DIR, "github_gateway.local.json"))
 _MERGE_POLICY_FILE = os.path.join(_RUNS_DIR, "merge_policy.local.json")
-_COMPOSED = os.path.join(_RUNS_DIR, "composed")
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def normalize_repo(value: str | None) -> str:
+    """owner/name from what attendees actually paste: a URL, a trailing .git or slash.
+
+    A live event produced every one of these: a clone URL ending in .git made the
+    Gateway ask GitHub for ``repos/owner/name.git`` and answer 404."""
+    repo = (value or "").strip()
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:", "github.com/"):
+        if repo.lower().startswith(prefix):
+            repo = repo[len(prefix):]
+            break
+    repo = repo.rstrip("/")
+    return repo[:-4] if repo.lower().endswith(".git") else repo
+
+
+def repo_problem(value: str) -> str:
+    """Which part of owner/name is wrong, with the fix."""
+    example = 'for example: export GITHUB_REPO="octocat/my-agent-project"'
+    if "@" in value.split("/")[0]:
+        return f"'{value}' is not owner/name: use your GitHub username, not an email address ({example})"
+    if "/" not in value:
+        return (f"'{value}' is not owner/name: add your GitHub username, as "
+                f"'your-username/{value}' ({example})")
+    return f"'{value}' is not owner/name ({example})"
 
 # The Gateway target name the deploy script creates (deploy-gateway.sh:
 # TARGET_NAME="GitHubMCP"). Gateway namespaces every tool as ``<target>___<tool>``.
@@ -70,20 +93,6 @@ _DEFAULT_TARGET = "GitHubMCP"
 WORKSHOP_REPO = os.environ.get(
     "WORKSHOP_REPO",
     "aws-samples/sample-amazon-bedrock-agentcore-coding-agents")
-
-# git subprocess hardening: pin config to /dev/null so a planted ~/.gitconfig
-# (e.g. a malicious credential helper) is never read, and never prompt.
-_GIT_TRACE_VARS = ("GIT_TRACE", "GIT_TRACE_PACKET", "GIT_TRACE_PERFORMANCE",
-                   "GIT_TRACE_SETUP", "GIT_CURL_VERBOSE", "GIT_TRACE_CURL")
-
-
-def _git_env() -> dict:
-    env = {k: v for k, v in os.environ.items() if k not in _GIT_TRACE_VARS}
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
-    env["GIT_CONFIG_SYSTEM"] = os.devnull
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    return env
-
 
 # Idempotent branch used only to prove the GitHub App can write before a build.
 # Actual work always uses ``workshop/runs/<run_id>/<agent>-<suffix>``, one branch
@@ -161,17 +170,20 @@ def _gateway_config() -> dict | None:
     gateway (writes the state file) and set the repo in Settings.
     """
     file = _load_config_file()
-    gateway_url = (os.environ.get("GITHUB_GATEWAY_URL")
-                   or file.get("gateway_url")
-                   or _discover_gateway_url() or "").strip()
-    repo = (os.environ.get("GITHUB_REPO") or file.get("repo") or "").strip()
+    # The first value that is actually a URL: an exported or saved "null" (from
+    # `jq -r` on an unfinished deploy) must not hide the auto-discovered Gateway.
+    gateway_url = next((str(v).strip() for v in (
+        os.environ.get("GITHUB_GATEWAY_URL"), file.get("gateway_url"))
+        if v and str(v).strip().startswith("https://")), "") or (
+        _discover_gateway_url() or "").strip()
+    repo = normalize_repo(os.environ.get("GITHUB_REPO") or file.get("repo"))
     if not gateway_url or not _REPO_RE.match(repo):
         return None
     target = (os.environ.get("GITHUB_GATEWAY_TARGET")
               or file.get("target") or _DEFAULT_TARGET).strip()
-    if os.environ.get("GITHUB_GATEWAY_URL"):
+    if (os.environ.get("GITHUB_GATEWAY_URL") or "").strip() == gateway_url:
         source = "environment"
-    elif file.get("gateway_url"):
+    elif (file.get("gateway_url") or "").strip() == gateway_url:
         source = "settings"
     else:
         source = "discovered"
@@ -389,12 +401,17 @@ def save_settings(repo: str, gateway_url: str | None = None,
     the PR lands). ``gateway_url`` is normally wired by the workshop (env), so the
     console may omit it; when present it is saved too.
     """
-    repo = (repo or "").strip()
+    repo = normalize_repo(repo)
     if not _REPO_RE.match(repo):
-        return {"error": "repo must be owner/name"}
+        return {"error": f"repo {repo_problem(repo)}"}
     file = _load_config_file()
     file["repo"] = repo
     gateway_url = (gateway_url or "").strip()
+    if gateway_url and not gateway_url.startswith("https://"):
+        # `jq -r .gateway_url` prints "null" when deploy-all.sh did not finish; saved,
+        # that "null" overrode auto-discovery until someone noticed.
+        return {"error": f"gateway URL {gateway_url!r} is not an https:// URL; rerun "
+                         "./deploy-all.sh until it prints Gateway verification passed"}
     if gateway_url:
         file["gateway_url"] = gateway_url
     if merge_policy_value is not None:
@@ -404,6 +421,8 @@ def save_settings(repo: str, gateway_url: str | None = None,
         os.chmod(_RUNS_DIR, 0o700)
     except OSError:
         pass
+    # The settings file may live elsewhere (the console reads the attendee's clone).
+    os.makedirs(os.path.dirname(_SETTINGS) or ".", mode=0o700, exist_ok=True)
     with open(_SETTINGS, "w", encoding="utf-8") as f:
         json.dump(file, f)
     os.chmod(_SETTINGS, 0o600)
@@ -490,10 +509,10 @@ def doctor() -> dict[str, Any]:
     cfg = _gateway_config()
     if not add("config_resolved", cfg is not None,
                "gateway URL + owner/repo resolved"
-               if cfg else "no gateway URL and/or repo is wired"):
-        return done("Export GITHUB_GATEWAY_URL and GITHUB_REPO (the Broker GitHub "
-                    "Tools page, step 4), or paste owner/repo in console Settings. "
-                    "Until then pre-flight stops before any builder runs.")
+               if cfg else _missing_gateway_config_hint().split(". ")[0]):
+        # Say WHAT is wrong: a malformed GITHUB_REPO was reported as "not wired",
+        # asking people to export values they had already exported.
+        return done(_missing_gateway_config_hint())
     add("repo_shape", bool(_REPO_RE.match(cfg["repo"])),
         f"repo is {cfg['repo']!r}")
 
@@ -547,9 +566,10 @@ def doctor() -> dict[str, Any]:
         reason = str(exc)
         lowered = reason.lower()
         if "not found" in lowered or "404" in lowered:
-            detail = (f"the App installation cannot see {cfg['repo']} (404). Either "
-                      "the App is installed on a different repository, or "
-                      "GITHUB_REPO names the wrong owner/repo.")
+            detail = (f"the App installation cannot see {cfg['repo']} (404). Check, in "
+                      "order: the repository has at least one commit (create it with "
+                      "Add README, or add a README.md now); GITHUB_REPO matches the "
+                      "repository URL exactly; the App's Repository access includes it.")
         elif "401" in lowered or "credential" in lowered or "auth" in lowered:
             detail = ("the App credential was rejected. Re-run deploy-credential.sh "
                       "with the App ID, installation ID, and .pem that belong "
@@ -650,7 +670,7 @@ def _repo_parts(cfg: dict) -> tuple[str, str]:
 
 def configured_repository() -> str:
     """The selected target, without probing its Gateway or substituting this repo."""
-    return (os.environ.get("GITHUB_REPO") or _load_config_file().get("repo") or "").strip()
+    return normalize_repo(os.environ.get("GITHUB_REPO") or _load_config_file().get("repo"))
 
 
 def _extract_repository_archive(encoded: str, destination: str) -> int:
@@ -772,21 +792,22 @@ def _missing_gateway_config_hint() -> str:
     have_url = bool((os.environ.get("GITHUB_GATEWAY_URL")
                      or file.get("gateway_url")
                      or _discover_gateway_url() or "").strip())
-    repo = (os.environ.get("GITHUB_REPO") or file.get("repo") or "").strip()
+    repo = normalize_repo(os.environ.get("GITHUB_REPO") or file.get("repo"))
     have_repo = bool(_REPO_RE.match(repo))
     tail = ("This workflow opens role pull requests before validation, so both must "
             "be known before any agent runs.")
     if have_url and not have_repo:
         return ("the GitHub Gateway is wired, but no target repository is set. Put "
-                f"your owner/name in the console Settings pane{'' if not repo else f' (got {repo!r}, which is not owner/name)'}, "
+                f"your owner/name in the console Settings pane{'' if not repo else f' ({repo_problem(repo)})'}, "
                 f"or export GITHUB_REPO. {tail}")
     if have_repo and not have_url:
         return ("the target repository is set, but no GitHub MCP Gateway URL "
                 "resolved. Deploy the Gateway (it writes .deployed-state.json, which "
                 f"is auto-discovered) or export GITHUB_GATEWAY_URL. {tail}")
     return ("neither the GitHub MCP Gateway URL nor the target repository resolved. "
-            "Deploy the Gateway and set your owner/name, then run "
-            f"`python3 orchestrator/github.py doctor`. {tail}")
+            "Deploy the Gateway, then export GITHUB_GATEWAY_URL and GITHUB_REPO "
+            "(Lab 3, Connect GitHub, step 1) or set owner/name in console Settings, and run "
+            f"`python3 orchestrator/github.py doctor` again. {tail}")
 
 
 def _item_labels(run: Any, item: Any) -> list[dict[str, str]]:
@@ -1029,6 +1050,90 @@ def post_review(run: Any, body_md: str) -> dict[str, Any]:
 
 # --- CLI ----------------------------------------------------------------------
 
+# The ports the pages start each checkout on: Lab 2 plays ~/game on 8000, and Lab 3
+# starts ~/game-lab3 on 8001 so the original keeps running beside it.
+_PLAY_PORTS = {"game": 8000, "game-lab3": 8001}
+# Part 4 (and its Go further follow-up) publish the team's game to the event gallery
+# straight from the checkout, so the hint is the Share What You Built page, not a local play port.
+# October 13 live walk: the old hint told the room to ask Claude Code to start it.
+_GALLERY_PORTS = {"team-game": 8000, "team-game-v2": 8001}
+
+
+def _print_play_hint(destination: str) -> None:
+    """After a checkout, name the finished URL to open instead of asking for one.
+
+    September 25 attendees assembled ``<VS Code origin>/proxy/8000/`` by hand and got
+    a login page, a missing slash, or nothing listening. The stack publishes the
+    origin, so print it. Advisory only: it can never change checkout's result or exit
+    code, and it prints no credential.
+    """
+    try:
+        import workshop_urls
+
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        shown = destination
+        if home and destination.startswith(home.rstrip("/") + "/"):
+            shown = "~/" + destination[len(home.rstrip("/")) + 1:]
+        name = os.path.basename(destination.rstrip("/"))
+        if name in _GALLERY_PORTS:
+            print(f"\nNext: run the setup its README names (for a Node game, cd {shown} && "
+                  "npm install), then publish it with its start command after --:")
+            print("  cd ~/sample-amazon-bedrock-agentcore-coding-agents && python3 "
+                  f"orchestrator/gallery.py publish --project {shown} --port "
+                  f"{_GALLERY_PORTS[name]} -- npm start")
+            return
+        port = _PLAY_PORTS.get(name)
+        if not port:
+            # Any other folder is a separate copy. 8000 and 8001 already serve the
+            # pages' games, so naming either would open the old game or fail to bind.
+            print(f"\nNext: cd {shown} && claude, and ask it to start the README's command "
+                  "on a free port (not 8000 or 8001, where the earlier games run). Then print "
+                  "its URL: python3 ~/sample-amazon-bedrock-agentcore-coding-agents/"
+                  "orchestrator/workshop_urls.py <port>")
+            return
+        print(f"\nNext: cd {shown} && claude, and ask it to start the README's command "
+              f"with PORT={port}. Once it is running:")
+        for line in workshop_urls.play_hint(port):
+            print(f"  {line}")
+    except Exception:  # noqa: BLE001 - a hint must never fail a completed checkout
+        pass
+
+
+def _refuse_checkout_into(destination: str) -> str | None:
+    """Why ``checkout`` must not replace ``destination``, or None when it is safe.
+
+    ``checkout`` REPLACES its destination. ``checkout .`` from the workshop clone,
+    where every page ``cd``s first, deleted the whole clone, including the GitHub
+    App's private key, and reported success. Only a new folder, an earlier
+    checkout, or a folder holding only a new repository's starter files is safe.
+    """
+    import run_advice  # noqa: PLC0415 - the same starter-file rule the watcher uses
+
+    dest = os.path.realpath(destination)
+    home = os.path.realpath(os.path.expanduser("~"))
+    clone = os.path.realpath(os.path.dirname(_HERE))
+    here = os.path.realpath(os.getcwd())
+    if dest in (os.sep, home):
+        return "that is your home directory or the filesystem root"
+    if dest == clone or clone.startswith(dest + os.sep):
+        return "that is the workshop checkout itself (or a folder that contains it)"
+    if dest.startswith(clone + os.sep):
+        return "that is inside the workshop checkout"
+    if dest == here or here.startswith(dest + os.sep):
+        return "that is the folder this terminal is in"
+    if os.path.isfile(os.path.join(dest, _CHECKOUT_MARKER)):
+        return None
+    has_app, _count = run_advice.holds_app(dest)
+    if has_app:
+        return ("it already holds files that did not come from checkout; choose a new "
+                "folder such as ~/game-2, or remove that folder yourself first")
+    return None
+
+
+# Written into every checkout so a later checkout knows it may replace the folder.
+_CHECKOUT_MARKER = ".workshop-checkout"
+
+
 def _main(argv: list[str]) -> int:
     """`python3 orchestrator/github.py doctor|status|checkout <dir> [branch]`.
 
@@ -1051,7 +1156,13 @@ def _main(argv: list[str]) -> int:
         if len(argv) not in (2, 3):
             print(usage)
             return 2
-        destination = os.path.abspath(argv[1])
+        # expanduser: a quoted "~/game" otherwise created a literal "~" folder.
+        destination = os.path.abspath(os.path.expanduser(argv[1]))
+        refused = _refuse_checkout_into(destination)
+        if refused:
+            print(f"NOT CHECKED OUT: {destination}: {refused}. Checkout replaces its "
+                  "destination, so nothing was changed.")
+            return 1
         if len(argv) == 3:
             result = snapshot_branch(argv[2], destination)
         else:
@@ -1059,8 +1170,15 @@ def _main(argv: list[str]) -> int:
         if result.get("error"):
             print(f"NOT CHECKED OUT: {result['error']}")
             return 1
+        try:
+            with open(os.path.join(destination, _CHECKOUT_MARKER), "w", encoding="utf-8") as mark:
+                mark.write(json.dumps({"repo": result.get("repo"), "branch": result.get("branch"),
+                                       "sha": str(result.get("sha"))}) + "\n")
+        except OSError:
+            pass
         print(f"{result['repo']} @ {result.get('branch')} ({str(result.get('sha'))[:12]}) "
               f"-> {destination}: {result['files']} file(s)")
+        _print_play_hint(destination)
         return 0
     if len(argv) != 1:
         print(usage)

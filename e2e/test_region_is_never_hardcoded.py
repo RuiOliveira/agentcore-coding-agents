@@ -210,11 +210,16 @@ def test_role_deploys_refuse_a_cross_region_access_point() -> None:
     import re as _re
 
     root = os.path.dirname(_HERE)
+    # Four roles share runtime_deploy.assert_same_region; codex keeps its own wording.
+    with open(os.path.join(root, "coding-agents", "runtime_deploy.py"), encoding="utf-8") as fh:
+        shared = fh.read()
+    assert "def assert_same_region(" in shared and "REGION_MISMATCH" in shared
     for role in ("codex", "opencode", "claude-code", "kiro", "claude-code-validator"):
         path = os.path.join(root, "coding-agents", role, "deploy.py")
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
-        assert "REGION_MISMATCH" in src, (
+        uses_shared = "_assert_same_region = runtime_deploy.assert_same_region" in src
+        assert "REGION_MISMATCH" in src or uses_shared, (
             f"{role}/deploy.py has no same-region guard: a mount in one region and a "
             "Runtime in another must fail AT DEPLOY, not later as a phantom empty "
             "workspace.")
@@ -238,14 +243,14 @@ def test_the_small_model_is_wirable_and_always_an_inference_profile() -> None:
     saved = os.environ.pop("WORKSHOP_SMALL_MODEL", None)
     try:
         default = configure_opencode._small_model()
-        assert default.startswith("amazon-bedrock/us."), default
+        assert default.startswith(("amazon-bedrock/us.", "amazon-bedrock/global.")), default
         # An override without the provider prefix must be normalised, not doubled.
-        os.environ["WORKSHOP_SMALL_MODEL"] = "us.anthropic.claude-sonnet-4-6"
+        os.environ["WORKSHOP_SMALL_MODEL"] = "global.anthropic.claude-sonnet-5"
         assert configure_opencode._small_model() == (
-            "amazon-bedrock/us.anthropic.claude-sonnet-4-6")
-        os.environ["WORKSHOP_SMALL_MODEL"] = "amazon-bedrock/us.anthropic.claude-sonnet-4-6"
+            "amazon-bedrock/global.anthropic.claude-sonnet-5")
+        os.environ["WORKSHOP_SMALL_MODEL"] = "amazon-bedrock/global.anthropic.claude-sonnet-5"
         assert configure_opencode._small_model() == (
-            "amazon-bedrock/us.anthropic.claude-sonnet-4-6")
+            "amazon-bedrock/global.anthropic.claude-sonnet-5")
     finally:
         os.environ.pop("WORKSHOP_SMALL_MODEL", None)
         if saved is not None:

@@ -1,8 +1,19 @@
-FROM node:22-slim
+# Built with named contexts: docker buildx bake <role>, from the repository root (docker-bake.hcl).
+ARG WORKSHOP_RUNTIME_BASE_IMAGE=public.ecr.aws/amazonlinux/amazonlinux:2023@sha256:06da5a3362eda00c5114227ac81abe56dd9b943395553b7c64a310457f4d9e2b
+FROM ${WORKSHOP_RUNTIME_BASE_IMAGE}
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl ca-certificates awscli python3 python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+RUN dnf install -y --allowerasing \
+    git curl ca-certificates awscli python3.13 python3.13-pip \
+    nodejs22 nodejs22-npm openssl-snapsafe-libs tar gzip which findutils \
+    && dnf clean all \
+    && ln -s /usr/bin/node-22 /usr/local/bin/node \
+    && ln -s /usr/bin/npm-22 /usr/local/bin/npm \
+    && ln -s /usr/bin/npx-22 /usr/local/bin/npx \
+    && python3.13 -m venv /opt/workshop-python
+ENV PATH="/opt/workshop-python/bin:/usr/local/bin:${PATH}"
+RUN node --version && npm --version && npx --version && python3 --version \
+    && python3 -c 'import ssl; print(ssl.OPENSSL_VERSION)' \
+    && rpm -q openssl-snapsafe-libs
 
 # OpenTelemetry collector sidecar (otelcol-contrib): baked in so entrypoint.sh can
 # start it at container boot and re-sign the agent's unsigned OTLP to CloudWatch
@@ -14,18 +25,19 @@ RUN curl -fsSL -o /tmp/otelcol.tar.gz \
     && rm /tmp/otelcol.tar.gz \
     && /usr/local/bin/otelcol-contrib --version
 
-RUN npm install -g @anthropic-ai/claude-code
-
-RUN userdel -r node && \
-    useradd -m -d /home/agent -u 1000 agent && \
+RUN useradd -m -d /home/agent -u 1000 agent && \
     git config --global user.name "AgentCore Bot" && \
     git config --global user.email "agentcore@example.com"
 
+COPY --from=toolchain cli-versions.json cli_versions.py /opt/workshop-cli/
+RUN python3 /opt/workshop-cli/cli_versions.py install --cli claude-code \
+      --home /home/agent --user agent --receipt /opt/workshop-cli/installed.json
+
 COPY --chown=agent:agent CLAUDE.md /home/agent/CLAUDE.md
-# The backend-engineering harness skill, staged into the build context by setup.sh.
+# The backend-engineering harness skill, staged by the shared build helper.
 # The agent reads it from ~/skills and builds from principles (not a file spec).
-COPY --chown=agent:agent skills/ /home/agent/skills/
-COPY --chown=agent:agent healthcheck.py /app/healthcheck.py
+COPY --chown=agent:agent --from=skills backend-engineering/ /home/agent/skills/backend-engineering/
+COPY --chown=agent:agent --from=toolchain healthcheck.py /app/healthcheck.py
 COPY run.sh /app/run.sh
 COPY entrypoint.sh /app/entrypoint.sh
 COPY otel-collector-config.yaml /app/otel-collector-config.yaml
@@ -45,8 +57,8 @@ ENV CLAUDE_CODE_USE_BEDROCK=1
 # `✘ Auto-update failed: no write permission to npm prefix · Run claude doctor`
 # in the TUI footer. Seen on a live event box (2026-09-01, CLI 2.1.257). That is the
 # first thing an attendee sees inside the backend agent, at exactly the point the page
-# says "confirm it is alive", and it reads as a broken environment. Setting it here
-# covers every process in the image, so the interactive and dispatched paths agree.
+# says "confirm it is alive", and it reads as a broken environment. Keep the image
+# default; run.sh also exports it for command shells that omit the image environment.
 ENV DISABLE_AUTOUPDATER=1
 # Log stream name the collector writes to in /workshop/coding-agents/telemetry.
 ENV WORKSHOP_AGENT_NAME=claude_code
@@ -54,6 +66,11 @@ WORKDIR /app
 EXPOSE 8080
 USER agent
 
+# Reapply the manifest policy after the role's settings COPY, preserving its values.
+RUN python3 /opt/workshop-cli/cli_versions.py configure --cli claude-code \
+      --home /home/agent
+
 # entrypoint.sh starts the OTel collector at boot, then exec's the CMD.
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["python3", "/app/healthcheck.py"]
+# /ping: HealthyBusy while the agent CLI runs, so a detached session keeps working.
+CMD ["python3", "/app/healthcheck.py", "--agent", "claude-code", "--busy", "claude", "--busy", "claude-code"]

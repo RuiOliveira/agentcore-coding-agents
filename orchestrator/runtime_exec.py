@@ -27,6 +27,8 @@ keeping the engine's threading model unchanged.
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import json
 import os
 import re
@@ -36,6 +38,7 @@ import uuid
 from typing import Any, Callable
 
 import roles as _roles
+from pty_typing import typeable
 
 # Strip the VT/ANSI noise the PTY interleaves with output so sentinel lines
 # compare cleanly. In order: OSC (ESC ] … BEL/ST, set-title etc.); CSI (ESC [,
@@ -137,9 +140,30 @@ class ModelQuotaError(RoleExecutionError):
     """The CLI reached its model but the account's daily token allowance is spent."""
 
 
+class RoleTurnLimitError(RoleExecutionError):
+    """A native CLI exhausted its turn budget; a fresh dispatch restarts the task."""
+
+    def __init__(self, agent_id: str, turn_limit: int, exit_code: int,
+                 transcript: str):
+        self.agent_id = agent_id
+        self.turn_limit = turn_limit
+        self.exit_code = exit_code
+        super().__init__(
+            f"ROLE_TURN_LIMIT: {agent_id} reached its {turn_limit}-turn CLI limit "
+            f"and exited {exit_code}; transcript tail:\n{transcript[-600:]}")
+
+
+_CLAUDE_TURN_LIMIT_RE = re.compile(r"Error: Reached max turns \(([1-9][0-9]*)\)")
+
+
+# Only the CLI's own API error line counts. The transcript also carries the prompt
+# and, in the console's PTY, whatever the TUI showed (edit diffs included): a
+# generic "daily limit ... exceeded" pattern matched a participant's feature
+# ("once the daily limit is exceeded the API returns 429") and discarded a
+# successful build as MODEL_QUOTA_EXHAUSTED.
 _DAILY_MODEL_QUOTA_RE = re.compile(
-    r"too many tokens per day|daily (?:token )?(?:allowance|limit|quota).*(?:exceed|spent)",
-    re.IGNORECASE,
+    r"^\W*API Error:[^\n]*\b429\b[^\n]*too many tokens per day",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -176,26 +200,37 @@ def _client(region: str):
     return AgentCoreRuntimeClient(region=region)
 
 
-def dispatch_env(agent_id: str, run_subdir: str) -> dict[str, str]:
-    """The telemetry + identity + correlation env for a dispatched build.
+def _dispatch_env(role: "_roles.Role", region: str, run_subdir: str, agent_id: str,
+                  model: str, extra: dict[str, str] | None = None) -> tuple[dict[str, str], Any]:
+    """The environment every dispatched turn starts with, and the caller's identity.
 
-    The bounded headless shell receives it at launch so every build emits
-    attributed telemetry through the collector sidecar.
+    One copy for both the headless and the console-muxed dispatch (they had drifted):
+    the Runtime's own region, the role's registry env and telemetry env, the model
+    override for a CLI that reads it from the environment (``model_env``), the
+    authenticated submitter's attribution and telemetry labels, and the run.id /
+    agent.id correlation, merged (never overwritten) so the identity stamp survives.
+    Every role of one run carries the same run.id, so one Logs Insights query can
+    group a task's cost across the fleet although the CLIs share no trace tree.
     """
-    env = dict(_role(agent_id).telemetry_env)
+    env = {"AWS_REGION": region, "AWS_DEFAULT_REGION": region,
+           **(extra or {}), **role.env, **role.telemetry_env}
+    if role.model_env and model:
+        env[role.model_env] = model
+    identity = None
     try:
         from identity_baggage import get_current_identity
         identity = get_current_identity()
         if identity is not None and not identity.is_anonymous():
+            env.update(identity.to_env())
+            # Carry the known submitter into exported request events.
             env.update(identity.to_otel_env())
     except Exception:
-        pass
+        identity = None
     run_id = run_subdir.split("/", 1)[0]
-    _corr = f"run.id={run_id},agent.id={agent_id}"
-    _existing_res = env.get("OTEL_RESOURCE_ATTRIBUTES", "")
-    env["OTEL_RESOURCE_ATTRIBUTES"] = (
-        f"{_existing_res},{_corr}" if _existing_res else _corr)
-    return env
+    corr = f"run.id={run_id},agent.id={agent_id}"
+    existing = env.get("OTEL_RESOURCE_ATTRIBUTES", "")
+    env["OTEL_RESOURCE_ATTRIBUTES"] = f"{existing},{corr}" if existing else corr
+    return env, identity
 
 
 def _vault_key_prelude(role: "_roles.Role", region: str) -> str:
@@ -249,11 +284,19 @@ def _vault_key_prelude(role: "_roles.Role", region: str) -> str:
         "print(c.get_resource_api_key(workloadIdentityToken=t,"
         f"resourceCredentialProviderName={provider!r})['apiKey'],end='')"
     )
+    # AgentCore exec shells may omit the image's SDK environment from PATH.
+    # Match run.sh's host fallback and keep selection inside this key fetch.
+    fetch_command = (
+        "__workshop_vault_python=/opt/workshop-python/bin/python3; "
+        'if [ ! -x "$__workshop_vault_python" ]; then '
+        "__workshop_vault_python=python3; fi; "
+        f'"$__workshop_vault_python" -W ignore -c {shlex.quote(py)}'
+    )
     return (
-        f"{key_env}=\"$(python3 -W ignore -c {shlex.quote(py)})\"; "
+        f'{key_env}="$({fetch_command})"; '
         f"export {key_env}; "
         f"if [ -z \"${key_env}\" ]; then "
-        f"echo {shlex.quote(f'[auth] ERROR: no {key_env} for role {role.id}: the Token Vault credential provider {provider!r} on workload identity {workload!r} returned no key. Store the key with kiro_config.save_api_key(...) (console Settings > AgentCore runtimes > + Add API key) and re-run.')} >&2; "
+        f"echo {shlex.quote(f'[auth] ERROR: no {key_env} for role {role.id}: the Token Vault credential provider {provider!r} on workload identity {workload!r} returned no key. Save it with the hidden key prompt in Lab 1, Read a Harness and Store the Kiro Key, step 2 (Agent Studio: Settings > Kiro access); no redeploy is needed, then submit again.')} >&2; "
         "exit 1; fi; "
     )
 
@@ -297,32 +340,7 @@ def _build_command(agent_id: str, prompt: str, run_subdir: str,
     # Responses provider. There is no Mantle-region override.
     cli_region = region
     role = _role(agent_id)
-    env = {"AWS_REGION": cli_region, "AWS_DEFAULT_REGION": cli_region,
-           **role.env, **role.telemetry_env}
-    # A CLI that reads its model from the environment says so in the registry
-    # (model_env), so an override reaches it without this file knowing which CLI.
-    if role.model_env and model:
-        env[role.model_env] = model
-    # Propagate authenticated run attribution metadata into the runtime.
-    identity = None
-    try:
-        from identity_baggage import get_current_identity
-        identity = get_current_identity()
-        if identity is not None and not identity.is_anonymous():
-            env.update(identity.to_env())
-            # Carry the known submitter into exported request events.
-            env.update(identity.to_otel_env())
-    except Exception:
-        identity = None
-    # Task correlation: every role of one run carries the same run.id (and its
-    # own agent.id), so one Logs Insights query can group a single task's cost
-    # across the fleet even though the CLIs cannot join a shared trace tree.
-    # Merged (never overwritten) so the identity stamp above survives intact.
-    run_id = run_subdir.split("/", 1)[0]
-    _corr = f"run.id={run_id},agent.id={agent_id}"
-    _existing_res = env.get("OTEL_RESOURCE_ATTRIBUTES", "")
-    env["OTEL_RESOURCE_ATTRIBUTES"] = (
-        f"{_existing_res},{_corr}" if _existing_res else _corr)
+    env, identity = _dispatch_env(role, cli_region, run_subdir, agent_id, model)
     env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     cli = _cli_invocation(agent_id, "P", model, workdir)
 
@@ -383,8 +401,15 @@ def _build_command(agent_id: str, prompt: str, run_subdir: str,
             "fi; "
         )
 
+    # The command is TYPED into an interactive Runtime shell, so the prompt crosses
+    # readline as keystrokes: a tab in the participant's text was completed against
+    # /app filenames, CRLF doubled, and a Ctrl-C byte ran the rest as shell. base64
+    # has none of those bytes, so the CLI receives the participant's words exactly.
+    encoded = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+    # CLI and hydration errors may end stdout or stderr without a newline.
+    # Start the end marker on a new line so _slice can recognize it after merging.
     return (
-        f"P={shlex.quote(prompt)}; "
+        f'P="$(printf %s {encoded} | base64 -d)"; '
         f"B1={_RUN_BEGIN}-{nonce}; E1={_RUN_END}-{nonce}; "
         f'echo "$B1"; '
         f"rm -rf {shlex.quote(workdir)} {shlex.quote(seed_dir)} "
@@ -411,7 +436,7 @@ def _build_command(agent_id: str, prompt: str, run_subdir: str,
         f"git -C {shlex.quote(seed_dir)} worktree add -q -b "
         f"{shlex.quote(branch)} {shlex.quote(workdir)} HEAD; "
         f"__hydrate_rc=$?; fi; "
-        f"if [ $__hydrate_rc -ne 0 ]; then echo \"$E1\"; "
+        f"if [ $__hydrate_rc -ne 0 ]; then printf '\\n%s\\n' \"$E1\"; "
         f"rm -rf {shlex.quote(workdir)} {shlex.quote(seed_dir)}; "
         f"exit $__hydrate_rc; fi; "
         f"{skill_setup}"
@@ -430,7 +455,7 @@ def _build_command(agent_id: str, prompt: str, run_subdir: str,
         "--only-show-errors; __pack_rc=$?; fi; "
         f"rm -f {shlex.quote(result_archive)}; "
         f"rm -rf {shlex.quote(workdir)} {shlex.quote(seed_dir)}; "
-        f'echo "$E1"; '
+        f"printf '\\n%s\\n' \"$E1\"; "
         f"if [ $__rc -ne 0 ]; then exit $__rc; fi; "
         f"exit $__pack_rc\n"
     )
@@ -456,28 +481,10 @@ def _interactive_dispatch_commands(agent_id: str, run_subdir: str,
     branch = worktree_branch(run_subdir)
     role = _role(agent_id)
 
-    env = {"AWS_REGION": region, "AWS_DEFAULT_REGION": region,
-           "WORKSHOP_AGENT_WORKDIR": workdir,
-           **role.env, **role.telemetry_env}
-    if role.model_env and model:
-        env[role.model_env] = model
-
-    identity = None
-    user_id = "unknown"
-    try:
-        from identity_baggage import get_current_identity
-        identity = get_current_identity()
-        if identity is not None and not identity.is_anonymous():
-            user_id = identity.user_id
-            env.update(identity.to_env())
-            env.update(identity.to_otel_env())
-    except Exception:
-        identity = None
-
-    run_id = run_subdir.split("/", 1)[0]
-    corr = f"run.id={run_id},agent.id={agent_id}"
-    existing = env.get("OTEL_RESOURCE_ATTRIBUTES", "")
-    env["OTEL_RESOURCE_ATTRIBUTES"] = f"{existing},{corr}" if existing else corr
+    env, identity = _dispatch_env(role, region, run_subdir, agent_id, model,
+                                  extra={"WORKSHOP_AGENT_WORKDIR": workdir})
+    user_id = (identity.user_id if identity is not None and not identity.is_anonymous()
+               else "unknown")
     env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
 
     # Fetch a vendor key under the Runtime role BEFORE the optional per-user role
@@ -563,6 +570,48 @@ def _interactive_dispatch_commands(agent_id: str, run_subdir: str,
             "workdir": workdir, "user_id": user_id, "nonce": nonce}
 
 
+# Opening a shell starts the session's microVM when it is new, and the SDK gives the
+# WebSocket handshake websockets' default 10 s. A cold session can take longer (October
+# 13: the first dispatch after a Runtime update failed `TimeoutError: timed out during
+# opening handshake`, and the whole team build stopped with ROLE_EXECUTION_ERROR while
+# the same Runtime answered in 4 s minutes later). Nothing has been typed into a shell
+# that never opened, so a bounded retry on the SAME session and shell IDs is safe: it
+# reaches the microVM the first attempt started. Any other error is raised at once.
+CONNECT_ATTEMPTS = 3
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+def _transient_connect_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) in _RETRY_STATUS
+
+
+@contextlib.asynccontextmanager
+async def _open_shell(client: Any, runtime_arn: str, session_id: str, shell_id: str,
+                      deadline: float, sleep: Callable[[float], Any] = asyncio.sleep):
+    attempt = 0
+    while True:
+        attempt += 1
+        session = client.open_shell(runtime_arn=runtime_arn, session_id=session_id,
+                                    shell_id=shell_id)
+        try:
+            shell = await session.__aenter__()
+        except Exception as exc:  # noqa: BLE001 (re-raised unless it is transient)
+            wait = 2.0 * attempt
+            if (attempt >= CONNECT_ATTEMPTS or not _transient_connect_error(exc)
+                    or time.monotonic() + wait >= deadline):
+                raise
+            await sleep(wait)
+            continue
+        try:
+            yield shell
+        finally:
+            await session.__aexit__(None, None, None)
+        return
+
+
 async def _drive_shell(runtime_arn: str, command: str, region: str,
                        on_line: Callable[[str], None] | None,
                        timeout_s: float, session_id: str) -> dict[str, Any]:
@@ -574,8 +623,7 @@ async def _drive_shell(runtime_arn: str, command: str, region: str,
     exit_code: int | None = None
     deadline = time.monotonic() + timeout_s
 
-    async with client.open_shell(runtime_arn=runtime_arn, session_id=session_id,
-                                 shell_id=shell_id) as shell:
+    async with _open_shell(client, runtime_arn, session_id, shell_id, deadline) as shell:
         # asyncio.wait_for on EACH frame, not a check inside the loop body. The
         # deadline used to be tested only after a frame arrived, so a shell that
         # connected and then went silent blocked forever: `async for` simply never
@@ -584,7 +632,7 @@ async def _drive_shell(runtime_arn: str, command: str, region: str,
         # both with zero output) until killed by hand. A run that hangs reports no
         # verdict at all, which is worse than any red gate, so the wall clock -- not
         # the peer -- has to decide when to give up.
-        await asyncio.wait_for(shell.send(command),
+        await asyncio.wait_for(shell.send(typeable(command)),
                                timeout=max(1.0, deadline - time.monotonic()))
         frames = shell.__aiter__()
         pending = ""   # the half line a frame boundary cut in two
@@ -1059,7 +1107,7 @@ def run_in_runtime(runtime_arn: str, agent_id: str, prompt: str, run_subdir: str
     could be de-registered or have a transient outage, surfaced as a nonzero exit
     with a model-down signature. ``llm.openai_sibling`` returns a healthy sibling
     ONLY for an ``openai.*`` model id, so this retry fires only for that provider.
-    The served Codex frontend uses a ``us.openai.*`` Runtime inference profile,
+    The served Codex frontend uses a ``global.openai.*`` Runtime inference profile,
     so ``openai_sibling`` returns None. Its errors remain failures; it must not
     silently switch to the legacy Mantle model family.
 
@@ -1125,6 +1173,17 @@ def run_in_runtime(runtime_arn: str, agent_id: str, prompt: str, run_subdir: str
             f"account's daily token allowance for {model} is exhausted; "
             f"transcript tail:\n{transcript[-600:]}")
     if run["exit"] != 0:
+        # Pinned Claude Code's text formatter ends a capped turn with this exact
+        # line and a nonzero exit. Match the full CLI-only terminal line, before
+        # display truncation, rather than quoted prose or an elapsed-time guess.
+        # Read the CLI from the registry so the kept Claude checker works too.
+        if (type(run["exit"]) is int
+                and _role(agent_id).cli.split(maxsplit=1)[0] == "claude"):
+            limit = _CLAUDE_TURN_LIMIT_RE.fullmatch(
+                _clean(transcript).rstrip().rsplit("\n", 1)[-1])
+            if limit:
+                raise RoleTurnLimitError(
+                    agent_id, int(limit.group(1)), run["exit"], transcript)
         sibling = llm.openai_sibling(model)
         if sibling and llm.cli_model_is_down(transcript):
             if on_line:

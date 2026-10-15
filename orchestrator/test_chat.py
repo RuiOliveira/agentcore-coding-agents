@@ -13,6 +13,8 @@ import base64
 import json
 import os
 import sys
+import threading
+import time
 
 import pytest
 
@@ -32,10 +34,29 @@ chat.use_engine(chat._engine.Engine(executor_obj=FixtureExecutor()))
 
 
 @pytest.fixture(autouse=True)
-def _pin_fixture_engine():
+def _pin_fixture_engine(monkeypatch):
     """Guarantee chat.ENGINE is the fixture-backed engine for every test here,
     regardless of what another test module's import-time use_engine() left behind."""
-    chat.use_engine(chat._engine.Engine(executor_obj=FixtureExecutor()))
+    fixture_engine = chat._engine.Engine(executor_obj=FixtureExecutor())
+    monkeypatch.setattr(chat, "ENGINE", fixture_engine)
+    # Keep the real heartbeat, with a short poll for bounded test teardown.
+    monkeypatch.setattr(chat._engine, "_PERSIST_HEARTBEAT_S", 1.0)
+    try:
+        yield
+    finally:
+        # submit() starts _drive and _heartbeat; shutdown() is a no-op. Drain
+        # this engine's workers before monkeypatch restores config/_RUNS_DIR,
+        # otherwise their final checkpoints can enter a later test's history.
+        workers = [
+            thread for thread in threading.enumerate()
+            if getattr(getattr(thread, "_target", None), "__self__", None)
+            is fixture_engine
+        ]
+        deadline = time.monotonic() + 30
+        for worker in workers:
+            worker.join(timeout=max(0, deadline - time.monotonic()))
+        alive = [worker.name for worker in workers if worker.is_alive()]
+        assert not alive, f"Fixture engine workers did not finish: {alive}"
 
 
 @pytest.fixture(autouse=True)
@@ -320,7 +341,9 @@ def test_a_direction_cannot_silently_replace_an_unrelated_custom_task(tmp_path, 
     result = json.loads(_call(
         "run_build", task="an existing custom request", preset="game-from-scratch",
         creative_direction="a different direction"))
-    assert result["error"] == "AMBIGUOUS_PRESET_DIRECTION"
+    # Refused either way: the participant never named the preset (the model's task
+    # argument is ignored, so it cannot make the direction "ambiguous" on its own).
+    assert result["error"] in ("AMBIGUOUS_PRESET_DIRECTION", "PRESET_NOT_REQUESTED")
 
 
 def test_run_build_accepts_any_request_at_all(tmp_path, monkeypatch):
@@ -349,7 +372,7 @@ def test_available_models_comes_from_the_real_bedrock_catalog():
     cat = chat.available_models()
     ids = {m["id"] for m in cat["models"]}
     # ids are full Bedrock ids resolved from llm.BEDROCK_MODEL_MAP, not aliases
-    assert "us.anthropic.claude-sonnet-4-6" in ids
+    assert "global.anthropic.claude-sonnet-5" in ids
     assert all(m.get("label") for m in cat["models"])      # every entry is labelled
     assert cat["default"] == chat.DEFAULT_MODEL_ID
     assert cat["default"] in ids
@@ -472,3 +495,18 @@ def test_stream_chat_emits_keepalives_while_the_model_is_silent(monkeypatch):
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_a_team_build_under_auto_merge_reports_the_checker_starting_early(monkeypatch):
+    """October 13: the coordinator told the room the checker waits for both builders
+    while the watcher showed it start on the service under auto merge."""
+    builders = roles.builder_ids()
+    assert len(builders) >= 2, "the served roster has two builders"
+    agents = [*builders[:2], *roles.checker_ids()]
+    monkeypatch.setenv("WORKSHOP_MERGE_POLICY", "auto")
+    timing = {row["agent"]: row["timing"] for row in chat._schedule(agents)}
+    assert all("as soon as each builder's pull request can be judged" in timing[c]
+               for c in roles.checker_ids())
+    monkeypatch.setenv("WORKSHOP_MERGE_POLICY", "human_review")
+    assert all(row["timing"] == "after every selected builder finishes"
+               for row in chat._schedule(agents) if row["kind"] == roles.CHECKER)

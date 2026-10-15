@@ -13,6 +13,7 @@ import sys
 from types import SimpleNamespace
 
 import boto3
+from botocore.exceptions import ClientError
 import pytest
 
 
@@ -36,6 +37,7 @@ def launcher(tmp_path):
         "from pathlib import Path\n"
         "Path(os.environ['CLAUDE_TEST_RECORD']).write_text(json.dumps({"
         "'argv': sys.argv[1:], 'cwd': os.getcwd(), "
+        "'disable_autoupdater': os.environ.get('DISABLE_AUTOUPDATER'), "
         "'bedrock': os.environ.get('CLAUDE_CODE_USE_BEDROCK')}))\n"
         "sys.exit(int(os.environ.get('CLAUDE_TEST_EXIT', '0')))\n"
     )
@@ -53,11 +55,13 @@ def launcher(tmp_path):
     for name in ("run.sh", "run-as-user.sh"):
         (tmp_path / name).write_text((HARNESS / name).read_text().replace(
             "/proc/1/environ", str(proc_environment)))
+    (tmp_path / "validator.sh").write_text(
+        (ROOT / "coding-agents" / "claude-code-validator" / "run.sh").read_text())
     clean_env = {
         key: value for key, value in os.environ.items()
         if key not in MODEL_VARIABLES
         and not key.startswith(("AWS_", "AGENTCORE_RUNTIME_"))
-        and key not in ("GATEWAY_URL", "GITHUB_TOKEN", "KIRO_API_KEY")
+        and key not in ("GATEWAY_URL", "GITHUB_TOKEN", "KIRO_API_KEY", "DISABLE_AUTOUPDATER")
     }
     clean_env.update({
         "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
@@ -86,16 +90,28 @@ def launcher(tmp_path):
     return run
 
 
+@pytest.mark.parametrize("path", ["run.sh", "validator.sh"])
+def test_headless_launchers_do_not_impose_a_turn_count_or_hide_cli_failure(launcher, path):
+    prompt = "Complete the requested work and report its verification"
+    result, record = launcher(
+        path, overrides={"CLAUDE_TEST_EXIT": "23"}, prompt=prompt)
+    assert result.returncode == 23
+    arguments = record["argv"]
+    assert arguments.count("--print") == 1
+    assert "--max-turns" not in arguments
+    assert arguments[-1] == prompt
+
+
 @pytest.mark.parametrize("path", ["run.sh", "run-as-user.sh"])
 @pytest.mark.parametrize("overrides,expected", [
-    ({}, "us.anthropic.claude-opus-5"),
+    ({}, "global.anthropic.claude-sonnet-5"),
     ({"ANTHROPIC_MODEL": "native-model"}, "native-model"),
     ({"ANTHROPIC_MODEL": "native-model", "WORKSHOP_CLAUDE_MODEL": "stack-model"}, "stack-model"),
     ({"WORKSHOP_CLAUDE_MODEL": "stack-model", "WORKSHOP_MODEL": "generic-model"}, "generic-model"),
     ({"WORKSHOP_CLAUDE_MODEL": "stack-model", "WORKSHOP_MODEL": "generic-model",
       "WORKSHOP_MODEL_CLAUDE_CODE": "role-model"}, "role-model"),
     ({"WORKSHOP_CLAUDE_MODEL": "", "WORKSHOP_MODEL": "",
-      "WORKSHOP_MODEL_CLAUDE_CODE": ""}, "us.anthropic.claude-opus-5"),
+      "WORKSHOP_MODEL_CLAUDE_CODE": ""}, "global.anthropic.claude-sonnet-5"),
 ])
 def test_model_environment_precedence_reaches_the_cli(launcher, path, overrides, expected):
     result, record = launcher(path, overrides)
@@ -117,7 +133,7 @@ def test_effort_default_override_and_omission_reach_the_cli(launcher, path, effo
         assert "--effort" not in arguments
     else:
         assert arguments.count("--effort") == 1
-        assert arguments[arguments.index("--effort") + 1] == (effort or "high")
+        assert arguments[arguments.index("--effort") + 1] == (effort or "low")
 
 
 @pytest.mark.parametrize("args", [
@@ -149,8 +165,19 @@ def test_interactive_launcher_honors_settings_without_switching_to_print_mode(la
     arguments = record["argv"]
     assert "--print" not in arguments
     assert arguments[arguments.index("--model") + 1] == (
-        "explicit-model" if args else "us.anthropic.claude-opus-5")
-    assert arguments[arguments.index("--effort") + 1] == ("max" if args else "high")
+        "explicit-model" if args else "global.anthropic.claude-sonnet-5")
+    assert arguments[arguments.index("--effort") + 1] == ("max" if args else "low")
+
+
+@pytest.mark.parametrize("prompt", [None, "Inspect the task"], ids=["interactive", "headless"])
+@pytest.mark.parametrize("updater", [None, "0"], ids=["missing", "enabled"])
+def test_direct_launcher_enforces_pinned_update_policy(launcher, prompt, updater):
+    # Neither the caller nor PID 1 supplies the image's update policy. An explicit
+    # attempt to enable updates must also leave the pinned installation protected.
+    overrides = {} if updater is None else {"DISABLE_AUTOUPDATER": updater}
+    result, record = launcher(overrides=overrides, prompt=prompt)
+    assert result.returncode == 0, result.stderr
+    assert record["disable_autoupdater"] == "1"
 
 
 @pytest.mark.parametrize("path", ["run.sh", "run-as-user.sh"])
@@ -182,6 +209,8 @@ def _deploy_module(tmp_path, monkeypatch, control):
     backend.mkdir(parents=True)
     source = backend / "deploy.py"
     shutil.copyfile(HARNESS / "deploy.py", source)
+    for shared in ("runtime_deploy.py", "cli_versions.py", "cli-versions.json"):
+        shutil.copyfile(ROOT / "coding-agents" / shared, agents / shared)
     (agents / "infra.config").write_text(
         "INFRA_REGION=us-west-2\nINFRA_ACCOUNT_ID=123456789012\n"
         "INFRA_SUBNET_1=subnet-one\nINFRA_SUBNET_2=subnet-two\n"
@@ -201,27 +230,34 @@ def _deploy_module(tmp_path, monkeypatch, control):
 
 @pytest.mark.parametrize("existing", [False, True, "conflict"])
 @pytest.mark.parametrize("effort", ["max", ""])
+@pytest.mark.parametrize("platform", ["V1", "V2"])
 def test_deploy_forwards_only_public_backend_settings_on_create_and_update(
-        tmp_path, monkeypatch, existing, effort):
+        tmp_path, monkeypatch, existing, effort, platform):
+    monkeypatch.setenv("WORKSHOP_RUNTIME_PLATFORM_VERSION", platform)
     calls = []
-    conflict = type("Conflict", (Exception,), {})
-
     class Control:
-        exceptions = SimpleNamespace(
-            ConflictException=conflict, ResourceNotFoundException=type("Missing", (Exception,), {}),
-        )
+        revision = "1"
 
         def create_agent_runtime(self, **kwargs):
             calls.append(kwargs)
             if existing == "conflict":
-                raise conflict()
-            return {"agentRuntimeId": "backend-test", "agentRuntimeArn": "arn:test"}
+                raise ClientError({"Error": {"Code": "ConflictException", "Message": "name exists"}},
+                                  "CreateAgentRuntime")
+            return {"agentRuntimeId": "backend-test", "agentRuntimeArn": "arn:test",
+                    "agentRuntimeVersion": "1", "status": "CREATING", "createdAt": 100}
 
         def update_agent_runtime(self, **kwargs):
             calls.append(kwargs)
+            self.revision = "2"
+            return {"agentRuntimeId": "backend-test", "agentRuntimeArn": "arn:test",
+                    "agentRuntimeVersion": "2", "status": "UPDATING",
+                    "createdAt": 100, "lastUpdatedAt": 200}
 
         def get_agent_runtime(self, **kwargs):
-            return {"status": "READY"}
+            return {"status": "READY", "platformVersion": platform,
+                    "agentRuntimeVersion": self.revision, "agentRuntimeName": "claude_code",
+                    "createdAt": 100, "lastUpdatedAt": 200 if self.revision == "2" else 100,
+                    "agentRuntimeId": "backend-test", "agentRuntimeArn": "arn:test"}
 
         def get_paginator(self, name):
             return SimpleNamespace(paginate=lambda: [{
@@ -244,7 +280,9 @@ def test_deploy_forwards_only_public_backend_settings_on_create_and_update(
         monkeypatch.setenv(name, "test-do-not-forward")
     result = module.deploy_runtime("arn:aws:iam::123456789012:role/backend")
     assert result["runtime_id"] == "backend-test"
+    assert result["platform_version"] == platform
     for arguments in calls:
+        assert arguments["platformVersion"] == platform
         assert arguments["environmentVariables"] == {
             "AWS_REGION": "us-west-2", "WORKSHOP_AGENT_NAME": "claude_code", **settings,
         }

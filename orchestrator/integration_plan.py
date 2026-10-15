@@ -22,8 +22,12 @@ from work_items import WorkItem, dependency_order
 
 PLAN_MODEL = os.environ.get(
     "WORKSHOP_INTEGRATION_PLAN_MODEL",
-    os.environ.get("ORCHESTRATOR_MODEL_ID", "claude-sonnet-4-6"),
+    os.environ.get("ORCHESTRATOR_MODEL_ID", "claude-sonnet-5"),
 )
+# Measured October 13 on the team-game request: at the model's default effort the
+# brief overran its 2,500-token cap, came back as truncated JSON and needed the repair
+# call (about 55 s before any builder started); at low it was valid in 9 to 10 s.
+PLAN_EFFORT = os.environ.get("WORKSHOP_INTEGRATION_PLAN_EFFORT", "low").strip()
 
 _SYSTEM = """You are the integration lead for a small software team.
 Turn one user request and a dynamic role roster into a shared implementation
@@ -123,6 +127,7 @@ def select_capabilities(
             f"AVAILABLE CAPABILITIES: {json.dumps(allowed)}",
             system=_ROUTE_SYSTEM,
             max_tokens=400,
+            effort=PLAN_EFFORT,
         )
         parsed = _json_object(response.get("text") or "")
         chosen = parsed.get("capabilities")
@@ -275,7 +280,8 @@ def create(task: str, items: Iterable[WorkItem],
                 )
             try:
                 response = llm.invoke(
-                    PLAN_MODEL, prompt, system=_SYSTEM, max_tokens=2500)
+                    PLAN_MODEL, prompt, system=_SYSTEM, max_tokens=2500,
+                    effort=PLAN_EFFORT)
             except Exception as exc:
                 raise IntegrationPlanError(
                     f"INTEGRATION_BRIEF_UNAVAILABLE: {exc}") from exc
@@ -300,6 +306,31 @@ def create(task: str, items: Iterable[WorkItem],
         previous = item
     dependency_order(builders)
     return normalized
+
+
+def ownership_guidance(items: Iterable[WorkItem]) -> str:
+    """Describe the routed ownership without inventing an absent teammate."""
+    builders = [item for item in items if item.kind == "builder"]
+    if len(builders) == 1:
+        return (
+            "You are the only builder assigned to this request. Own the complete "
+            "requested behavior, including any interface and persistence it needs. "
+            "There is no other builder's implementation to wait for. Complete and "
+            "verify a runnable result in your checkout; the separate validator "
+            "decides acceptance."
+        )
+    return (
+        "Ownership is exclusive. Implement the outcome assigned to your role. "
+        "Your isolated checkout does not contain the other builders' work; do not "
+        "ship a stand-in or second implementation of a sibling role's capability. "
+        "If you need a local substitute while developing, keep it out of your "
+        "submitted tree: not even a placeholder of a file a sibling owns (a stub "
+        "page in their folder, say), because the earlier pull request merges first "
+        "and a stub turns the later one into a conflict its owner must rebuild. "
+        "Shared manifests and entrypoints are allowed when the "
+        "integration needs them; the later role in the merge order reconciles those "
+        "files against the earlier role's actual patch."
+    )
 
 
 def markdown(task: str, plan: dict[str, Any], items: Iterable[WorkItem]) -> str:
@@ -350,14 +381,7 @@ def markdown(task: str, plan: dict[str, Any], items: Iterable[WorkItem]) -> str:
         "are ready at once, and it decides who refreshes if a merge moves a path "
         "someone else also changed.",
         "",
-        "Ownership is exclusive. Implement the outcome assigned to your role, not "
-        "the entire request in isolation. Your checkout is intentionally incomplete "
-        "until the coordinator combines it with the other role checkouts. Do not "
-        "ship a stand-in or second implementation of a sibling role's capability. "
-        "If you need a local substitute while developing, keep it out of your "
-        "submitted tree. Shared manifests and entrypoints are allowed when the "
-        "integration needs them; the later role in the merge order reconciles those "
-        "files against the earlier role's actual patch.",
+        ownership_guidance(by_agent.values()),
     ]
     questions = plan.get("open_questions") or []
     if questions:
@@ -433,6 +457,7 @@ def select_repair_agents(
             + json.dumps(payload, indent=2),
             system=_REPAIR_SYSTEM,
             max_tokens=800,
+            effort=PLAN_EFFORT,
         )
         parsed = _json_object(response.get("text") or "")
         chosen = parsed.get("agents")

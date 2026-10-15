@@ -124,11 +124,11 @@ def test_unset_roster_override_is_not_forwarded(monkeypatch, tmp_path):
 def test_stack_model_settings_reach_a_fresh_coordinator_process(monkeypatch, tmp_path):
     """The host's stack model parameters must survive the deployment boundary."""
     settings = {
-        "WORKSHOP_CLAUDE_MODEL": "us.anthropic.claude-sonnet-4-6",
-        "WORKSHOP_CODEX_MODEL": "us.openai.gpt-5.6-sol",
-        "WORKSHOP_OPENCODE_MODEL": "amazon-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "WORKSHOP_SMALL_MODEL": "us.anthropic.claude-sonnet-4-6",
-        "ORCHESTRATOR_MODEL_ID": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "WORKSHOP_CLAUDE_MODEL": "global.anthropic.claude-sonnet-5",
+        "WORKSHOP_CODEX_MODEL": "global.openai.gpt-5.6-sol",
+        "WORKSHOP_OPENCODE_MODEL": "amazon-bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "WORKSHOP_SMALL_MODEL": "global.anthropic.claude-sonnet-5",
+        "ORCHESTRATOR_MODEL_ID": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
     }
     for name, value in settings.items():
         monkeypatch.setenv(name, value)
@@ -155,6 +155,37 @@ def test_stack_model_settings_reach_a_fresh_coordinator_process(monkeypatch, tmp
         "claude-code": settings["WORKSHOP_CLAUDE_MODEL"],
         "codex": settings["WORKSHOP_CODEX_MODEL"],
         "opencode": settings["WORKSHOP_OPENCODE_MODEL"],
+    }
+
+
+def test_explicit_review_model_survives_a_backend_model_change(monkeypatch, tmp_path):
+    """The deployed reviewer must keep its own selection after backend promotion."""
+    settings = {
+        "WORKSHOP_CLAUDE_MODEL": "us.anthropic.claude-opus-5",
+        "WORKSHOP_REVIEW_MODEL": "  global.anthropic.claude-sonnet-5  ",
+    }
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+    env = _configure(monkeypatch, tmp_path)
+
+    # A fresh process must see only the generated model settings. Inheriting the
+    # deployment shell's review override would conceal a missing envVars entry.
+    child_env = {
+        name: value for name, value in os.environ.items()
+        if not name.startswith("WORKSHOP_")
+    }
+    child_env.update(env)
+    child_env["PYTHONPATH"] = str(HERE.parent / "orchestrator")
+    result = subprocess.check_output(
+        [sys.executable, "-c",
+         "import json, roles, reviewer; print(json.dumps({"
+         "'backend': roles.get('claude-code').default_model, "
+         "'reviewer': reviewer.INTEGRATED_REVIEW_MODEL}))"],
+        env=child_env, text=True,
+    )
+    assert json.loads(result) == {
+        "backend": "us.anthropic.claude-opus-5",
+        "reviewer": "global.anthropic.claude-sonnet-5",
     }
 
 
@@ -202,16 +233,39 @@ def test_unset_backend_effort_is_not_forwarded(monkeypatch, tmp_path):
     assert "WORKSHOP_CLAUDE_EFFORT" not in env
 
 
+@pytest.mark.parametrize("effort", [None, "medium", ""])
+def test_kiro_effort_survives_coordinator_configuration(monkeypatch, tmp_path, effort):
+    monkeypatch.delenv("WORKSHOP_KIRO_EFFORT", raising=False)
+    if effort is not None:
+        monkeypatch.setenv("WORKSHOP_KIRO_EFFORT", effort)
+    monkeypatch.setenv("KIRO_API_KEY", "must-not-enter-the-coordinator")
+    env = _configure(monkeypatch, tmp_path)
+    assert "KIRO_API_KEY" not in env
+    if effort is None:
+        assert "WORKSHOP_KIRO_EFFORT" not in env
+    child_env = {name: value for name, value in os.environ.items()
+                 if not name.startswith(("WORKSHOP_", "KIRO_"))}
+    child_env.update(env, PYTHONPATH=str(HERE.parent / "orchestrator"))
+    child = subprocess.check_output([
+        sys.executable, "-c",
+        "import json, roles; r=roles.get('kiro'); "
+        "print(json.dumps({'cli':r.cli,'env':r.env}))"],
+        env=child_env, text=True)
+    observed = json.loads(child)
+    expected = "low" if effort is None else effort
+    assert observed["env"]["WORKSHOP_KIRO_EFFORT"] == expected
+    assert (f"--effort {expected}" in observed["cli"]) == bool(expected)
+
 @pytest.mark.parametrize("overrides,options,backend_model,validator_model", [
-    ({}, {}, "us.anthropic.claude-opus-5", "us.anthropic.claude-opus-4-6-v1"),
-    ({"WORKSHOP_MODEL_CLAUDE_CODE_VALIDATOR": "us.anthropic.claude-sonnet-4-6"},
-     {}, "us.anthropic.claude-opus-5", "us.anthropic.claude-sonnet-4-6"),
-    ({"WORKSHOP_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-      "WORKSHOP_MODEL_CLAUDE_CODE_VALIDATOR": "us.anthropic.claude-sonnet-4-6"},
-     {}, "us.anthropic.claude-haiku-4-5-20251001-v1:0", "us.anthropic.claude-sonnet-4-6"),
-    ({"WORKSHOP_MODEL_CLAUDE_CODE_VALIDATOR": "us.anthropic.claude-sonnet-4-6"},
-     {"models": {"claude-code-validator": "us.anthropic.claude-haiku-4-5-20251001-v1:0"}},
-     "us.anthropic.claude-opus-5", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+    ({}, {}, "us.anthropic.claude-opus-5", "global.anthropic.claude-sonnet-5"),
+    ({"WORKSHOP_MODEL_CLAUDE_CODE_VALIDATOR": "global.anthropic.claude-sonnet-5"},
+     {}, "us.anthropic.claude-opus-5", "global.anthropic.claude-sonnet-5"),
+    ({"WORKSHOP_MODEL": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "WORKSHOP_MODEL_CLAUDE_CODE_VALIDATOR": "global.anthropic.claude-sonnet-5"},
+     {}, "global.anthropic.claude-haiku-4-5-20251001-v1:0", "global.anthropic.claude-sonnet-5"),
+    ({"WORKSHOP_MODEL_CLAUDE_CODE_VALIDATOR": "global.anthropic.claude-sonnet-5"},
+     {"models": {"claude-code-validator": "global.anthropic.claude-haiku-4-5-20251001-v1:0"}},
+     "us.anthropic.claude-opus-5", "global.anthropic.claude-haiku-4-5-20251001-v1:0"),
 ])
 def test_restored_validator_model_is_resolved_after_coordinator_configuration(
         monkeypatch, tmp_path, overrides, options, backend_model, validator_model):
@@ -260,9 +314,9 @@ print(json.dumps({"roster": roles.roster_ids(), "roles": records}))
     backend = resolved["roles"]["claude-code"]
     validator = resolved["roles"]["claude-code-validator"]
     assert backend["default"] == "us.anthropic.claude-opus-5"
-    assert validator["default"] == "us.anthropic.claude-opus-4-6-v1"
+    assert validator["default"] == "global.anthropic.claude-sonnet-5"
     for role, expected, effort in (
-            (backend, backend_model, "high"), (validator, validator_model, "xhigh")):
+            (backend, backend_model, "low"), (validator, validator_model, "xhigh")):
         argv = role["argv"]
         assert argv[argv.index("--model") + 1] == expected
         assert argv[argv.index("--effort") + 1] == role["effort"] == effort
@@ -274,7 +328,7 @@ print(json.dumps({"roster": roles.roster_ids(), "roles": records}))
 def test_absent_model_settings_keep_coordinator_defaults(monkeypatch, tmp_path, value):
     names = (
         "WORKSHOP_CLAUDE_MODEL", "WORKSHOP_CODEX_MODEL", "WORKSHOP_OPENCODE_MODEL",
-        "WORKSHOP_SMALL_MODEL", "ORCHESTRATOR_MODEL_ID",
+        "WORKSHOP_SMALL_MODEL", "WORKSHOP_REVIEW_MODEL", "ORCHESTRATOR_MODEL_ID",
     )
     for name in names:
         if value is None:
@@ -304,6 +358,7 @@ def test_stack_bucket_reaches_coordinator_archives_and_state_reader(
     import runtime_stage
 
     monkeypatch.delenv("WORKSHOP_RUNTIME_BUCKET", raising=False)
+    monkeypatch.delenv("WORKSHOP_RUN_MIRROR_DISCOVERY", raising=False)
     monkeypatch.setenv("WORKSHOP_BEDROCK_REGION", "us-west-2")
     monkeypatch.setattr(runtime_stage, "_SOURCE_ROOT", tmp_path)
     monkeypatch.setattr(runtime_stage, "_account_id", lambda region: "123456789012")
@@ -353,3 +408,41 @@ def test_incomplete_infrastructure_cannot_silently_select_a_different_bucket(
     _write_infra(tmp_path, bucket="")
     with pytest.raises(RuntimeError, match="INFRA_BUCKET"):
         _configure(monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize("platform,limit", [("V1", 4096), ("V2", 2500)])
+def test_oversized_coordinator_environment_fails_before_project_write(
+        monkeypatch, tmp_path, platform, limit):
+    monkeypatch.setenv("WORKSHOP_RUNTIME_PLATFORM_VERSION", platform)
+    monkeypatch.setenv("WORKSHOP_MODEL_EXTRA", "x" * limit)
+    with pytest.raises(RuntimeError, match=f"{platform} container environment") as exc:
+        _configure(monkeypatch, tmp_path)
+    project = tmp_path / "CodingAgents/agentcore/agentcore.json"
+    assert json.loads(project.read_text()) == {
+        "runtimes": [{"name": "orchestrator", "build": "Container"}]}
+    assert not (project.parent / "aws-targets.json").exists()
+    assert "x" * limit not in str(exc.value)
+
+
+@pytest.mark.parametrize("platform", ["V1", "V2"])
+def test_coordinator_configure_uses_selected_platform_budget(monkeypatch, tmp_path, platform):
+    monkeypatch.setenv("WORKSHOP_RUNTIME_PLATFORM_VERSION", platform)
+    monkeypatch.setenv("WORKSHOP_MODEL_EXTRA", "x" * 2100)
+    if platform == "V2":
+        with pytest.raises(RuntimeError, match="V2 container environment"):
+            _configure(monkeypatch, tmp_path)
+    else:
+        env = _configure(monkeypatch, tmp_path)
+        assert env["WORKSHOP_MODEL_EXTRA"] == "x" * 2100
+        assert 2500 < configure_deploy.runtime_deploy.validate_environment(env) < 4096
+        assert "WORKSHOP_RUNTIME_PLATFORM_VERSION" not in env, "deployment choice is not a container setting"
+
+
+def test_invalid_coordinator_platform_fails_before_project_write(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSHOP_RUNTIME_PLATFORM_VERSION", "v2")
+    with pytest.raises(RuntimeError, match="WORKSHOP_RUNTIME_PLATFORM_VERSION"):
+        _configure(monkeypatch, tmp_path)
+    project = tmp_path / "CodingAgents/agentcore/agentcore.json"
+    assert json.loads(project.read_text()) == {
+        "runtimes": [{"name": "orchestrator", "build": "Container"}]}
+    assert not (project.parent / "aws-targets.json").exists()

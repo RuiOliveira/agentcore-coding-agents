@@ -33,7 +33,6 @@ import reviewer  # noqa: E402
 from reviewer import (  # noqa: E402
     LGTM_TOKEN,
     Verdict,
-    branch_run_id,
 )
 from work_items import WorkItem  # noqa: E402
 
@@ -65,21 +64,6 @@ class _FakeRun:
 
     def item_tree_dir(self, work_id: str) -> str:
         return self._item_trees.get(work_id, "")
-
-
-# ----------------------------------------------------- the strict branch-suffix guard
-def test_branch_run_id_maps_a_run_branch_back_to_its_run():
-    assert branch_run_id("run/run_103512_004") == "run_103512_004"
-    assert (
-        branch_run_id("run/run_103512_a1b2c3d4e5f6")
-        == "run_103512_a1b2c3d4e5f6"
-    )
-
-
-def test_branch_run_id_refuses_lookalikes():
-    for bad in ("run/run_103512_004-extra", "feature/run_103512_004",
-                "run/run_1035_004", "run/%", "run/run_abcdef_004", "", None):
-        assert branch_run_id(bad) is None
 
 
 # --------------------------------------------------------- constants the engine reads
@@ -210,7 +194,7 @@ def test_judge_outage_blocks_merge_without_inventing_a_finding():
     ):
         verdict = reviewer.assess(_FakeRun(), _GREEN_GATE, 1, judge=judge)
         assert verdict.lgtm is False
-        assert verdict.state == "changes_requested"
+        assert verdict.state == "unavailable", "an outage requests no changes"
         assert verdict.review_unavailable is True
         assert len(verdict.panels) == 1
         assert verdict.panels[0]["name"] == "integrated"
@@ -384,12 +368,14 @@ def test_integrated_review_runs_once_and_either_lens_can_block(
 
     calls = []
 
-    def invoke(model, prompt, system=None, max_tokens=0):
+    def invoke(model, prompt, system=None, max_tokens=0, tool=None, effort=""):
         calls.append({
             "model": model,
             "prompt": prompt,
             "system": system,
             "max_tokens": max_tokens,
+            "tool": tool,
+            "effort": effort,
         })
         return {
             "model_id": "integrated-review-model",
@@ -416,6 +402,10 @@ def test_integrated_review_runs_once_and_either_lens_can_block(
     monkeypatch.setattr(llm, "invoke", invoke)
     review = reviewer._default_judge(run, _GREEN_GATE, backend)
     assert len(calls) == 1
+    # The verdict arrives through a schema, so a long reasoning answer cannot
+    # truncate or break its own JSON (a Claude 5 failure at a 3,200 cap).
+    assert calls[0]["tool"]["toolSpec"]["name"] == "submit_review"
+    assert calls[0]["max_tokens"] >= 16000
     assert "Apply BOTH" in calls[0]["system"]
     assert "Adversarial verification" in calls[0]["system"]
     assert "Design and integration" in calls[0]["system"]
@@ -741,3 +731,13 @@ def test_gate_summary_skips_the_started_services_own_log_lines():
 
     # And the empty case still falls back to the exit code.
     assert reviewer._summary_line("", 1) == "exit 1"
+
+
+def test_double_escaped_lens_newlines_render_as_markdown():
+    """A lens whose line breaks arrived as literal backslash-n renders as bullets."""
+    decode = reviewer._decode_literal_newlines
+    one_line = "- Seam matches.\\n- Duplicate guard resets.\\n- Not run in a browser."
+    assert decode(one_line) == "- Seam matches.\n- Duplicate guard resets.\n- Not run in a browser."
+    mixed = "Intro line\n- first\\n- second uses `split(\"\\n\")`"
+    assert decode(mixed) == "Intro line\n- first\n- second uses `split(\"\\n\")`"
+    assert decode("plain text") == "plain text"

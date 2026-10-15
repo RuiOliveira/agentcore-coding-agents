@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  The pull request endpoint of the workshop's Lab 3: GitHub calls it, and an agent
+  wakes in its own AgentCore Runtime session to review the change. Deploy it from
+  this folder with aws cloudformation package, then aws cloudformation deploy.
+Resources:
+  # Pull request reviews: GitHub calls this endpoint for every pull request event of the workshop
+  # App, and an agent wakes in its own Runtime session to review the change.
+  PrReviewLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${AWS::StackName}/PrReviewWebhook
+      RetentionInDays: 7
+  PrReviewRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub agentcore-pr-review-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WakeAReviewSession
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt PrReviewLogGroup.Arn
+              # The webhook secret only. The App's private key is in another secret,
+              # which only the Gateway's GitHub tools read.
+              - Sid: WebhookSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:agentcore/github-mcp/webhook-??????
+              - Sid: OnceEach
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt PrReviewDeliveries.Arn
+              - Sid: HandOffToItself
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}
+              - Sid: FindTheRuntimeAndGateway
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:ListGateways
+                  - bedrock-agentcore:GetGateway
+                Resource: '*'
+              - Sid: GitHubToolsThroughTheGateway
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*
+              - Sid: OneReviewSession
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntimeCommand
+                  - bedrock-agentcore:StopRuntimeSession
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/claude_code-*
+  PrReviewFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref AWS::StackName
+      Description: Wakes a Claude Code session on AgentCore Runtime to review a pull request
+      Handler: handler.handler
+      Runtime: python3.13
+      Architectures:
+        - arm64
+      Timeout: 900
+      MemorySize: 256
+      Role: !GetAtt PrReviewRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref PrReviewLogGroup
+      Environment:
+        Variables:
+          DELIVERIES_TABLE: !Ref PrReviewDeliveries
+      # aws cloudformation package zips this folder (handler.py) and uploads it.
+      Code: .
+  # The hand-off is an asynchronous invoke of the function itself. Lambda retries a
+  # failed asynchronous invoke twice by default, which would post a second review.
+  PrReviewHandOff:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref PrReviewFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+      MaximumEventAgeInSeconds: 900
+  # The digests of the signed bodies already acted on, kept for twice the replay window.
+  PrReviewDeliveries:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-deliveries
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires
+        Enabled: true
+  PrReviewApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-pr-review
+      ProtocolType: HTTP
+      Description: GitHub pull request events for the workshop App
+  PrReviewIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PrReviewApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PrReviewFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 10000
+  PrReviewRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PrReviewApi
+      RouteKey: POST /github
+      Target: !Sub integrations/${PrReviewIntegration}
+  PrReviewStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PrReviewApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+  PrReviewInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PrReviewFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${PrReviewApi}/*/POST/github
+  PrReviewWebhookUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /workshop/webhook-url
+      Type: String
+      Description: The pull request review endpoint the workshop GitHub App delivers events to
+      Value: !Sub https://${PrReviewApi}.execute-api.${AWS::Region}.amazonaws.com/github
+Outputs:
+  WebhookUrl:
+    Description: The URL the GitHub App delivers pull request events to
+    Value: !Sub https://${PrReviewApi}.execute-api.${AWS::Region}.amazonaws.com/github

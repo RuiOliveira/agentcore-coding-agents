@@ -27,6 +27,9 @@ sys.path.insert(0, str(HERE.parent / "orchestrator"))
 import roles as _roles  # noqa: E402
 import runtime_stage  # noqa: E402
 
+sys.path.insert(0, str(HERE.parent / "coding-agents"))
+import runtime_deploy  # noqa: E402
+
 
 def ROLES() -> tuple[str, ...]:
     """The role ids whose deployed runtime ARNs the orchestrator project needs."""
@@ -34,8 +37,18 @@ def ROLES() -> tuple[str, ...]:
 
 
 def _region(value: str | None) -> str:
-    return value or os.environ.get("AWS_REGION") or os.environ.get(
-        "AWS_DEFAULT_REGION", "us-west-2")
+    """The deployment region, never a literal: a us-west-2 default mis-wired every
+    us-east-1 deploy run from a shell without the workshop exports."""
+    region = value or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if not region:
+        try:
+            import boto3  # noqa: PLC0415
+            region = boto3.session.Session().region_name
+        except Exception:  # noqa: BLE001
+            region = None
+    if not region:
+        raise SystemExit("No AWS region: export AWS_REGION (the workshop's deployment region).")
+    return region
 
 
 # The two role ARNs configure_deploy needs. They have DETERMINISTIC names set by
@@ -70,6 +83,21 @@ def _stack_outputs(stack_name: str, region: str) -> dict[str, str]:
     return {}
 
 
+def named_runtime_arn(role: str, region: str | None = None) -> str:
+    """The ARN of the Runtime named after a role (``claude-code`` -> ``claude_code``), or "".
+
+    A Runtime built in the AgentCore console has no runtime_config.json; its name is the
+    whole contract, exactly as in the console's own Runtime list."""
+    import boto3  # noqa: PLC0415
+    name = role.replace("-", "_")
+    client = boto3.client("bedrock-agentcore-control", region_name=_region(region))
+    for page in client.get_paginator("list_agent_runtimes").paginate():
+        for runtime in page.get("agentRuntimes", []):
+            if runtime.get("agentRuntimeName") == name:
+                return runtime["agentRuntimeArn"]
+    return ""
+
+
 def _runtime_arns(source_root: Path) -> dict[str, str]:
     arns: dict[str, str] = {}
     for role in ROLES():
@@ -77,7 +105,10 @@ def _runtime_arns(source_root: Path) -> dict[str, str]:
         try:
             arn = json.loads(path.read_text(encoding="utf-8"))["runtime_arn"]
         except (OSError, KeyError, ValueError) as exc:
-            raise SystemExit(f"runtime ARN missing for {role}: {path} ({exc})") from exc
+            arn = named_runtime_arn(role) if not path.exists() else ""
+            if not arn:
+                raise SystemExit(f"runtime ARN missing for {role}: no {path} and no Runtime "
+                                 f"named {role.replace('-', '_')} ({exc})") from exc
         if not isinstance(arn, str) or not arn.startswith("arn:aws:bedrock-agentcore:"):
             raise SystemExit(f"invalid runtime ARN for {role}: {arn!r}")
         arns[role] = arn
@@ -134,17 +165,19 @@ def configure(project_file: Path, source_root: Path, outputs: dict[str, str],
     # The deployed process imports roles.py afresh; without these values it
     # silently returns to the package defaults instead of the stack's models.
     # Forward only named model settings, never the host's whole environment.
+    # Preserve the independent reviewer selection when the backend model changes.
     for var in (
         "WORKSHOP_CLAUDE_MODEL", "WORKSHOP_CODEX_MODEL", "WORKSHOP_OPENCODE_MODEL",
-        "WORKSHOP_SMALL_MODEL", "ORCHESTRATOR_MODEL_ID",
+        "WORKSHOP_SMALL_MODEL", "WORKSHOP_REVIEW_MODEL", "ORCHESTRATOR_MODEL_ID",
     ):
         value = os.environ.get(var, "").strip()
         if value:
             env[var] = value
     # Preserve an explicitly empty effort: it tells the headless launcher to omit
     # --effort. Dropping the value would silently restore the packaged default.
-    if "WORKSHOP_CLAUDE_EFFORT" in os.environ:
-        env["WORKSHOP_CLAUDE_EFFORT"] = os.environ["WORKSHOP_CLAUDE_EFFORT"].strip()
+    for var in ("WORKSHOP_CLAUDE_EFFORT", "WORKSHOP_KIRO_EFFORT"):
+        if var in os.environ:
+            env[var] = os.environ[var].strip()
     # WORKSHOP_ROLES rides in for the same reason, and its absence was a REAL defect:
     # the roster is read from the coordinator's OWN process env (roles.roster()), so a
     # facilitator who exported the documented Kiro fallback
@@ -161,6 +194,9 @@ def configure(project_file: Path, source_root: Path, outputs: dict[str, str],
     kiro_model = os.environ.get("WORKSHOP_KIRO_MODEL", "").strip()
     if kiro_model:
         env["WORKSHOP_KIRO_MODEL"] = kiro_model
+    # Reject oversized container settings before CDK builds or changes resources.
+    # Promotion also checks the final environment after CDK injects its values.
+    runtime_deploy.validate_environment(env)
     runtime["executionRoleArn"] = execution_role
     runtime["envVars"] = [{"name": name, "value": value} for name, value in sorted(env.items())]
 

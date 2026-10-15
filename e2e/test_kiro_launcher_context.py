@@ -8,7 +8,8 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def launch(tmp_path, *, staged=True, explicit_worktree=False):
+def launch(tmp_path, *, staged=True, explicit_worktree=False,
+           environment=None, arguments=None, inherited=None):
     private_home = tmp_path / "private home"
     shared = tmp_path / "shared workspace"
     private_steering = private_home / ".kiro/steering/validator.md"
@@ -16,6 +17,9 @@ def launch(tmp_path, *, staged=True, explicit_worktree=False):
     private_steering.parent.mkdir(parents=True)
     staged_steering.parent.mkdir(parents=True)
     private_steering.write_text("Baked checker instructions\n")
+    settings = private_home / ".kiro/settings/cli.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"existing.preference": "preserve", "app.disableAutoupdates": False}))
     if staged:
         staged_steering.write_text("Attendee-edited checker instructions\n")
     (shared / "AGENTS.md").write_text("You are the FRONTEND BUILDER\n")
@@ -45,6 +49,10 @@ pathlib.Path(os.environ["WORKSHOP_TEST_REPORT"]).write_text(json.dumps(record))
                             "export HOME=" + shlex.quote(str(private_home)))
     source = source.replace("/mnt/s3files/.kiro/steering/validator.md",
                             shlex.quote(str(staged_steering)))
+    pid1 = tmp_path / "pid1-environ"
+    pid1.write_bytes(b"".join(
+        f"{key}={value}\0".encode() for key, value in (inherited or {}).items()))
+    source = source.replace("/proc/1/environ", shlex.quote(str(pid1)))
     launcher = tmp_path / "run.sh"
     launcher.write_text(source)
     report = tmp_path / "child.json"
@@ -55,16 +63,22 @@ pathlib.Path(os.environ["WORKSHOP_TEST_REPORT"]).write_text(json.dumps(record))
         "GATEWAY_URL": "https://gateway.example",
         "KIRO_API_KEY": "fake-token-for-launcher-test",
         "WORKSHOP_TEST_REPORT": str(report),
+        "WORKSHOP_CLI_HELPER": str(ROOT / "coding-agents/cli_versions.py"),
     }
     if explicit_worktree:
         env["WORKSHOP_AGENT_WORKDIR"] = str(worktree)
+    env.update(environment or {})
     result = subprocess.run(
-        ["bash", str(launcher), "chat", "Describe your role"],
+        ["bash", str(launcher), *(arguments if arguments is not None
+                                 else ["chat", "Describe your role"])],
         cwd=shared, env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert (shared / "AGENTS.md").read_text() == "You are the FRONTEND BUILDER\n"
     assert (shared / "notes.md").read_text() == "Shared note remains available\n"
     assert not (private_home / "AGENTS.md").exists()
+    configured = json.loads(settings.read_text())
+    assert configured["app.disableAutoupdates"] is True
+    assert configured["existing.preference"] == "preserve"
     return json.loads(report.read_text()), private_home, worktree, private_steering
 
 
@@ -74,7 +88,8 @@ def test_manual_shell_reads_staged_checker_without_shared_frontend_context(tmp_p
     assert child["steering"] == "Attendee-edited checker instructions\n"
     assert not child["frontend_in_project"]
     assert child["args"] == [
-        "chat", "--no-interactive", "--trust-all-tools", "Describe your role"]
+        "chat", "--no-interactive", "--trust-all-tools", "--effort", "low",
+        "Describe your role"]
     assert steering.read_text() == child["steering"]
 
 

@@ -1,7 +1,7 @@
 # Codex on AgentCore Runtime
 
 This folder builds and deploys the workshop's frontend coding assistant. Codex
-CLI is pinned to **0.155.1** and uses **`us.openai.gpt-5.6-sol`** through the
+CLI is pinned to **0.155.1** and uses **`global.openai.gpt-5.6-sol`** through the
 built-in **`amazon-bedrock-runtime`** provider. That provider uses
 `https://bedrock-runtime.<region>.amazonaws.com/openai/v1` with Bedrock SigV4.
 The Runtime IAM role supplies the AWS SDK credential chain; no OpenAI or
@@ -91,6 +91,12 @@ raw SSE frames, API attempt events, prompts, tool content, and unrelated attribu
 It retains the native token counters and the user, team, agent, run, and session
 resource labels supplied by the console or coordinator. CloudWatch writes use the
 Runtime role, scoped to that log group.
+
+Codex's native OTLP metrics (`metrics_exporter`, which otherwise defaults to
+`statsig`) also go to the local collector. It keeps the same resource labels,
+copies an email-shaped `user.id` to `user.email`, and sends them to the
+CloudWatch OTLP metrics endpoint with the Runtime role. CloudWatch shows them
+under **GenAI Observability > Coding Agent Insights > Codex**.
 
 Codex 0.155.1 can emit a zero log timestamp with a valid observed timestamp. The
 collector uses that observed timestamp when the log timestamp is zero, so the
